@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <style>
+    #toolbar {
+      position: absolute; top: 10px; left: 10px; padding: 10px;
+      background: rgba(42, 42, 42, 0.8); color: #fff;
+      font-family: sans-serif; font-size: 12px;
+      border-radius: 4px; z-index: 999; min-width: 260px;
+    }
+    #toolbar label { display: block; margin: 6px 0 2px; }
+    #status { margin-top: 8px; font-size: 11px; opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="toolbar">
+    <label><input type="checkbox" id="chkMeshTiles" checked> 3D Tiles · 城市网格 (wuxi_260205)</label>
+    <label><input type="checkbox" id="chkMeshTilesB" checked> 3D Tiles · 城市网格 (wuxi_251022)</label>
+    <label><input type="checkbox" id="chkPointTiles" checked> 3D Tiles · 点云</label>
+    <label><input type="checkbox" id="chkBbox"> 聚类 · 包围盒 (AABB)</label>
+    <label><input type="checkbox" id="chkHull" checked> 聚类 · 凸包 (紧贴)</label>
+    <div id="status">就绪</div>
+  </div>
+
+  <script type="module">
+    Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJmMzAyYjZhMS1jNTMyLTRhNGMtOGM4Yy1iZGY3NWJlNmEzMWUiLCJpZCI6MzU1Nzk1LCJpYXQiOjE3NjE4OTk1NTl9.2CwqXFsXQkM26F-MDOrPac3dup9ZUi3qevHthrrEIlU';
+
+    // 无底图 / 无地形,只渲染 3D Tiles 与 Entity
+    const viewer = new Cesium.Viewer('cesiumContainer', {
+      terrain: undefined,
+      baseLayerPicker: false,
+    });
+    viewer.scene.globe.show = false;
+    viewer.scene.skyBox.show = false;
+    viewer.scene.skyAtmosphere.show = false;
+    viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#0a0e1a');
+
+    // 显式添加方向光 —— 关掉 globe 后默认太阳光不再照射 3D Tiles,
+    // 会让使用实时着色的 b3dm 显示为纯黑
+    viewer.scene.light = new Cesium.DirectionalLight({
+      direction: new Cesium.Cartesian3(0.3, -0.5, -1.0),
+      intensity: 2.5,
+    });
+
+    function setStatus(s) { document.getElementById('status').textContent = s; }
+
+    const tilesets = {};
+    // 聚类显示分两类,可独立勾选
+    const clusterDisplay = {
+      bbox: [],   // 每个 cluster 一个 AABB box entity
+      hull: [],   // 每个 cluster ~300 个三角形 polyline + 1 个 label entity
+    };
+
+    // —— 1. 加载城市网格 3D Tiles ——
+    async function loadMeshTiles() {
+      setStatus('正在加载城市网格 3D Tiles…');
+      try {
+        const ts = await Cesium.Cesium3DTileset.fromUrl(
+          '../../dataset/taicang_2605/tileset.json'
+        );
+        viewer.scene.primitives.add(ts);
+        await ts.readyPromise;
+        tilesets.mesh = ts;
+        setStatus('城市网格 3D Tiles 已加载');
+        return ts;
+      } catch (err) {
+        console.error('城市网格加载失败:', err);
+        setStatus('城市网格加载失败(检查 HTTP Range 支持)');
+        return null;
+      }
+    }
+
+    // —— 2. 加载点云 3D Tiles ——
+    async function loadPointTiles() {
+      setStatus('正在加载点云 3D Tiles…');
+      try {
+        const ts = await Cesium.Cesium3DTileset.fromUrl(
+          '../../dataset_output/test/taicang/3DTiles/tileset.json'
+        );
+        viewer.scene.primitives.add(ts);
+        await ts.readyPromise;
+        ts.style = new Cesium.Cesium3DTileStyle({
+          color: 'color("#ff3344", 0.9)',
+          pointSize: 3,
+        });
+        tilesets.points = ts;
+        setStatus('点云 3D Tiles 已加载');
+        return ts;
+      } catch (err) {
+        console.error('点云加载失败:', err);
+        setStatus('点云加载失败: ' + err.message);
+        return null;
+      }
+    }
+
+    // —— 把 cluster 的凸包顶点 + 三角形构造成 Cesium Primitive(半透明填充 mesh)——
+    // 用 Cesium.Primitive + PerInstanceColorAppearance 实现类似 bbox 那种
+    // 半透明填充的视觉效果,但形状是真实凸包,而不是 AABB。
+    function makeHullPrimitive(c, fillColor) {
+      const tris = c.hull_triangles || [];
+      if (tris.length === 0) return null;
+      const verts = c.hull_vertices_ecef;
+
+      // Float64Array flat:[x0,y0,z0, x1,y1,z1, ...]
+      const positions = new Float64Array(verts.length * 3);
+      for (let i = 0; i < verts.length; i++) {
+        positions[i*3]   = verts[i][0];
+        positions[i*3+1] = verts[i][1];
+        positions[i*3+2] = verts[i][2];
+      }
+      // Uint32Array flat indices:[a,b,c, d,e,f, ...]
+      const indices = new Uint32Array(tris.length * 3);
+      for (let i = 0; i < tris.length; i++) {
+        indices[i*3]   = tris[i][0];
+        indices[i*3+1] = tris[i][1];
+        indices[i*3+2] = tris[i][2];
+      }
+
+      const geometry = new Cesium.Geometry({
+        attributes: {
+          position: new Cesium.GeometryAttribute({
+            componentDatatype: Cesium.ComponentDatatype.DOUBLE,
+            componentsPerAttribute: 3,
+            values: positions,
+          }),
+        },
+        indices: indices,
+        primitiveType: Cesium.PrimitiveType.TRIANGLES,
+        boundingSphere: Cesium.BoundingSphere.fromVertices(positions),
+      });
+
+      const instance = new Cesium.GeometryInstance({
+        geometry: geometry,
+        id: `cluster_${c.id}_hull_mesh`,
+        attributes: {
+          color: Cesium.ColorGeometryInstanceAttribute.fromColor(fillColor),
+        },
+      });
+
+      // flat=true   → 不要光照,纯色填充
+      // translucent=true → 半透明,可以看到建筑点云穿透
+      // closed=false → 关闭背面剔除,从外面看 hull 的"内表面"不会被剔除
+      return new Cesium.Primitive({
+        geometryInstances: instance,
+        appearance: new Cesium.PerInstanceColorAppearance({
+          flat: true,
+          translucent: true,
+          closed: false,
+        }),
+        asynchronous: false,  // 同步构建,避免首帧闪烁
+        allowPicking: false,
+        show: true,
+      });
+    }
+
+    // —— 3. 加载聚类结果,同时构建 AABB 包围盒与凸包(填充 mesh)两组可视对象 ——
+    // chkBbox / chkHull 各自独立切换;数据加载一次,切换只改 show。
+    async function loadClusters() {
+      setStatus('正在加载聚类结果…');
+      try {
+        const resp = await fetch('../../dataset_output/test/taicang/instances.json');
+        const data = await resp.json();
+        const n = data.n_clusters;
+        console.log(`[Cluster] eps=${data.eps}, min_points=${data.min_points}, n_clusters=${n}, n_input=${data.n_input_points}`);
+
+        for (const c of data.clusters) {
+          // 每个 cluster 一色;填充用 22% alpha,描边用 100%
+          const hue = ((c.id - 1) / Math.max(n, 1) + 0.02) % 1.0;
+          const fillColor  = Cesium.Color.fromHsl(hue, 0.85, 0.50, 0.22);
+          const outlineCol = Cesium.Color.fromHsl(hue, 1.00, 0.55, 1.00);
+
+          const center = new Cesium.Cartesian3(
+            c.bbox_center_ecef[0],
+            c.bbox_center_ecef[1],
+            c.bbox_center_ecef[2]
+          );
+
+          // —— AABB 包围盒(默认隐藏)——
+          const bboxEntity = viewer.entities.add({
+            name: `cluster_${c.id}_bbox`,
+            show: false,
+            position: center,
+            orientation: Cesium.Transforms.headingPitchRollQuaternion(
+              center,
+              new Cesium.HeadingPitchRoll(0, 0, 0)
+            ),
+            box: {
+              dimensions: new Cesium.Cartesian3(
+                c.bbox_size[0],
+                c.bbox_size[1],
+                c.bbox_size[2]
+              ),
+              material: fillColor,
+              fill: true,
+              outline: true,
+              outlineColor: outlineCol,
+              outlineWidth: 2,
+            },
+          });
+          clusterDisplay.bbox.push(bboxEntity);
+
+          // —— 凸包:半透明填充 mesh(Primitive),默认显示 ——
+          const hullPrim = makeHullPrimitive(c, fillColor);
+          if (hullPrim) {
+            viewer.scene.primitives.add(hullPrim);
+            clusterDisplay.hull.push(hullPrim);
+          }
+
+          // —— label:跟凸包一起显示 ——
+          const labelEntity = viewer.entities.add({
+            name: `cluster_${c.id}_label`,
+            position: center,
+            label: {
+              text: `#${c.id} · ${c.num_points.toLocaleString()} pts\n${c.hull_vertices_ecef.length} verts · ${c.hull_triangles.length} tris`,
+              font: 'bold 13px sans-serif',
+              fillColor: Cesium.Color.WHITE,
+              outlineColor: Cesium.Color.BLACK,
+              outlineWidth: 3,
+              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              showBackground: true,
+              backgroundColor: new Cesium.Color(0, 0, 0, 0.55),
+              backgroundPadding: new Cesium.Cartesian2(8, 4),
+              pixelOffset: new Cesium.Cartesian2(0, -12),
+              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+              horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+              distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 2000),
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+          });
+          clusterDisplay.hull.push(labelEntity);
+        }
+        setStatus(`聚类结果已加载 · ${n} 个 cluster`);
+        return data;
+      } catch (err) {
+        console.error('聚类结果加载失败:', err);
+        setStatus('聚类结果加载失败: ' + err.message);
+        return null;
+      }
+    }
+
+    // —— 3.5. 加载第二个城市网格 3D Tiles(wuxi_251022,作为对比)——
+    async function loadMeshTilesB() {
+      setStatus('正在加载 wuxi_251022 3D Tiles…');
+      try {
+        const ts = await Cesium.Cesium3DTileset.fromUrl(
+          '../../dataset/taicang_2511/tileset.json'
+        );
+        viewer.scene.primitives.add(ts);
+        await ts.readyPromise;
+        tilesets.meshB = ts;
+        setStatus('wuxi_251022 3D Tiles 已加载');
+        return ts;
+      } catch (err) {
+        console.error('wuxi_251022 加载失败:', err);
+        setStatus('wuxi_251022 加载失败(检查 HTTP Range 支持)');
+        return null;
+      }
+    }
+
+    // 并行加载
+    const [meshTs, meshTsB, pointTs, clusterData] = await Promise.all([
+      loadMeshTiles(),
+      loadMeshTilesB(),
+      loadPointTiles(),
+      loadClusters(),
+    ]);
+
+    // —— 4. UI 事件 ——
+    document.getElementById('chkMeshTiles').addEventListener('change', e => {
+      if (tilesets.mesh) tilesets.mesh.show = e.target.checked;
+    });
+    document.getElementById('chkMeshTilesB').addEventListener('change', e => {
+      if (tilesets.meshB) tilesets.meshB.show = e.target.checked;
+    });
+    document.getElementById('chkPointTiles').addEventListener('change', e => {
+      if (tilesets.points) tilesets.points.show = e.target.checked;
+    });
+    document.getElementById('chkBbox').addEventListener('change', e => {
+      for (const ent of clusterDisplay.bbox) ent.show = e.target.checked;
+    });
+    document.getElementById('chkHull').addEventListener('change', e => {
+      for (const ent of clusterDisplay.hull) ent.show = e.target.checked;
+    });
+
+    // —— 5. 相机定位 ——
+    let fitted = false;
+    if (meshTs) {
+      try {
+        await viewer.zoomTo(meshTs,
+          new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-45), 600));
+        fitted = true;
+      } catch (e) { console.warn('zoomTo mesh failed:', e); }
+    }
+    if (!fitted && pointTs) {
+      try {
+        await viewer.zoomTo(pointTs,
+          new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-45), 600));
+        fitted = true;
+      } catch (e) { console.warn('zoomTo points failed:', e); }
+    }
+    if (!fitted && clusterData) {
+      let cx = 0, cy = 0, cz = 0;
+      for (const c of clusterData.clusters) {
+        cx += c.bbox_center_ecef[0];
+        cy += c.bbox_center_ecef[1];
+        cz += c.bbox_center_ecef[2];
+      }
+      const n = clusterData.clusters.length;
+      cx /= n; cy /= n; cz /= n;
+      const carto = Cesium.Cartographic.fromCartesian(new Cesium.Cartesian3(cx, cy, cz));
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(
+          Cesium.Math.toDegrees(carto.longitude),
+          Cesium.Math.toDegrees(carto.latitude),
+          carto.height + 400
+        ),
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch:   Cesium.Math.toRadians(-45),
+          roll:    0,
+        },
+        duration: 0,
+      });
+    }
+
+    setStatus(`就绪 · 260205 ${meshTs ? '✓' : '✗'} · 251022 ${meshTsB ? '✓' : '✗'} · 点云 ${pointTs ? '✓' : '✗'} · 聚类 ${clusterData ? clusterData.n_clusters : 0}`);
+  </script>
+</body>
+</html>

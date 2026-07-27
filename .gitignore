@@ -1,0 +1,56 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ----- Test / coverage artifacts -----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ----- Virtual envs -----
+.venv/
+venv/
+env/
+ENV/
+
+# ----- Editor / OS -----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ----- Runtime / deployment artifacts (do NOT commit) -----
+# service.log / service.pid are written by run_service.sh to repo root;
+# output/ contains per-task sidecars (status.json, instances.json, ...);
+# dataset_output/ is what `python -m scripts.algorithm.run_pipeline` writes
+# when invoked directly (not through the FastAPI service).
+service.log
+service.pid
+service.err
+output/
+dataset_output/
+data/output/
+
+# ----- Local secrets / per-deploy config -----
+scripts/service/oss_config.json
+.env
+.env.local
+*.local.yaml
+*.local.json
+
+# ----- Local data caches (downloaded 3D Tiles, etc.) -----
+# Uncomment if you do not want large b3dm / 3D Tiles datasets in git.
+# /model/
+# /data/
