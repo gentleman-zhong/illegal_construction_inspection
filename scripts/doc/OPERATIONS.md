@@ -574,6 +574,34 @@ source_xy = np.ascontiguousarray(source_xy)
 
 写新代码或 review 时一条规则：**永远不要在 `np.asarray(..., dtype=X, copy=False)` 上同时改 dtype**。要不就不要 `copy=False`，要不就让 dtype 透传，要么用 `ndarray.astype(X, copy=False)`（"软" copy=False 不会抛错，但会 copy）。
 
+**已知 v0.8 regression（已修复）：凸包 / 3D Tiles ECEF 偏移 4,651 km**
+
+v0.8 内存优化在 `scripts/algorithm/run_pipeline.py:stage_convert` 把 ECEF 公式从齐次形式
+
+```python
+homog = np.hstack([pts_diff, np.ones((N, 1))])
+ecef  = (homog @ T.T)[:, :3]      # 旧：占用 (N,4) 中间值
+```
+
+改写成代数形式以省掉 `(N,4)` 中间数组：
+
+```python
+T = np.asarray(transform_b, dtype=np.float64).reshape(4, 4, order="F")
+ecef = pts_diff @ T[:3, :3].T + T[3, :3]   # ← 这里索引错了
+```
+
+但 `T` 是按 3D Tiles 规范 **column-major** `reshape(order="F")`，平移列在 `T[:3, 3]`（不是 `T[3, :3]` —— 那是齐次行 `[0, 0, 0]`）。结果整个 `ecef` 丢了 EC EF 平移，所有凸包 / 3D Tiles 输出整体偏移局部原点的 ECEF 坐标，**上海区域实测 ~4,651 km**。
+
+**修复**（`scripts/algorithm/run_pipeline.py:535`）：
+
+```python
+ecef = pts_diff @ T[:3, :3].T + T[:3, 3]   # T[:3, 3] 是平移列
+```
+
+修复后与旧齐次形式 **bit-exact**（50 个随机 rigid transform × 100 随机点全部相等）。回归测试：`tests/algorithm/test_ecef_algebraic.py`，4 个 case（identity / Shanghai 真实 transform / 50 个随机 rigid / buggy form 控制），同时断言 ECEF 输出在百万米量级（ECEF 范围），不是局部米。
+
+**判定这次 bug 的方法**：跑完任务后 `jq '.clusters[0].bbox_center_ecef' output/<id>/instance.json`，值应当在 `[-3e6, 5e6, 4e6]` 量级；若只有几十到几百米 → bug 复现。
+
 ---
 
 ## 8. 日志与监控

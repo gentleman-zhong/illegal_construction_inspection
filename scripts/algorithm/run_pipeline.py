@@ -530,9 +530,18 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
     #        ecef = (homog @ T.T)[:, :3]
     #    which materialised a (N, 4) intermediate that was dropped
     #    immediately, costing 8 B/pt of transient RSS. The
-    #    affine-only split keeps the working set at (N, 3):
+    #    affine-only split keeps the working set at (N, 3).
+    #
+    #    CRITICAL: ``T`` is reshaped column-major per the 3D Tiles spec,
+    #    so the translation column sits at ``T[:3, 3]`` (NOT
+    #    ``T[3, :3]``, which is the homogeneous row = [0, 0, 0]).
+    #    Using ``T[3, :3]`` drops the entire ECEF translation,
+    #    offsetting every output ECEF by the local origin's
+    #    ECEF coordinates (~4,651 km for Shanghai). See
+    #    tests/algorithm/test_ecef_algebraic.py for a bit-exact
+    #    equivalence regression test.
     T = np.asarray(transform_b, dtype=np.float64).reshape(4, 4, order="F")
-    ecef = pts_diff @ T[:3, :3].T + T[3, :3]
+    ecef = pts_diff @ T[:3, :3].T + T[:3, 3]
     # (preserve pts_diff for cluster_instances — ecef needs the same N)
 
     # 2. DBSCAN cluster in ENU frame (now voxel-decimated internally)
