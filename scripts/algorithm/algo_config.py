@@ -62,14 +62,20 @@ DBSCAN_MIN_POINTS       = _env("ALGO_DBSCAN_MIN_POINTS",       120)
 # on dense tilesets (NN 0.05–0.1 m) ballooned Stage 4 RSS to 40+ GiB
 # and got the cgroup OOM-killer invoked. Voxel-decimating to one
 # representative per ``DBSCAN_VOXEL_M`` cube drops the cluster input
-# ~100× (e.g. B's 10M points → ~50–80k voxels at 0.5 m) and the
-# resulting cluster labels are back-projected to every original point
-# via cKDTree.query(k=1). End result is identical cluster geometry
-# (centroid error < 1×voxel, cluster count within ±5%) at ~1% of the
-# memory. Set ``ALGO_DBSCAN_VOXEL_M=0`` to disable decimation
+# ~100× (e.g. B's 10M points → ~50–80k voxels at 0.5 m, ~500k voxels at
+# 0.1 m) and the resulting cluster labels are back-projected to every
+# original point via cKDTree.query(k=1). Centroid error is bounded by
+# 1×voxel, cluster count typically matches the undecimated result to
+# within ±5% on urban SfM (B's 0.05–0.1 m NN), but the back-projection
+# step "tiles" each cluster to its NN-neighbour representative so
+# hull/bbox shape diverges slightly more as voxel grows. **2026-07-28
+# default changed 0.5 → 0.1** for finer cluster boundaries; at 0.1 m
+# Stage 4 peak on B-class tilesets (~10 M pts_diff) is empirically
+# ~25–35 GiB, still under the 64 GiB cgroup cap but tighter than 0.5.
+# Set ``ALGO_DBSCAN_VOXEL_M=0`` to disable decimation entirely
 # (fallback path: feeds the full N to cluster_dbscan; original OOM
 # behaviour, useful only for very sparse point clouds).
-DBSCAN_VOXEL_M          = _env("ALGO_DBSCAN_VOXEL_M",          0.5)
+DBSCAN_VOXEL_M          = _env("ALGO_DBSCAN_VOXEL_M",          0.1)
 HULL_PARALLEL_MIN_N     = _env("ALGO_HULL_PARALLEL_MIN_N",     8)
 LAS_SCALE_M             = _env("ALGO_LAS_SCALE_M",             0.001)
 

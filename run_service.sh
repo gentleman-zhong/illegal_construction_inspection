@@ -14,6 +14,15 @@ PORT="${PORT:-6601}"
 OUTPUT_BASE_DIR="${OUTPUT_BASE_DIR:-/root/illegal_construction_inspection/output}"
 MODEL_ROOT="${MODEL_ROOT:-/model}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+# 2026-07-28: 关闭 submit-time OOM pre-flight (参见 api_server.py:_PREFLIGHT_OK)。
+# 该 pre-flight 在大模型上是 30s+ 的 b3dm 扫描, fail-open 后每次提交都刷一行
+# warning,但 stage_convert 内部已有真实 cgroup 检查做兜底,所以关掉无害。
+# 想要恢复老行为: 启动前设 ALGO_DISABLE_OOM_PREFLIGHT=0
+ALGO_DISABLE_OOM_PREFLIGHT="${ALGO_DISABLE_OOM_PREFLIGHT:-1}"
+# 2026-07-28: 把 Stage 4 DBSCAN 体素下采样从 0.5 m → 0.1 m, 牺牲一点内存(~25-35 GiB
+# 峰值,仍在 64 GiB cgroup 内)换更精细的 cluster 形状 / 边界恢复率。
+# 想恢复 0.5 m 老行为: 启动前设 ALGO_DBSCAN_VOXEL_M=0.5; 完全关掉:设 0
+ALGO_DBSCAN_VOXEL_M="${ALGO_DBSCAN_VOXEL_M:-0.1}"
 PID_FILE="$REPO_ROOT/service.pid"
 LOG_FILE="$REPO_ROOT/service.log"
 UVICORN_PATTERN="uvicorn scripts.service.api_server"
@@ -42,10 +51,11 @@ start_service() {
         return 0
     fi
 
-    echo "启动服务 (port=$PORT, OUTPUT_BASE_DIR=$OUTPUT_BASE_DIR, MODEL_ROOT=$MODEL_ROOT) ..."
+    echo "启动服务 (port=$PORT, OUTPUT_BASE_DIR=$OUTPUT_BASE_DIR, MODEL_ROOT=$MODEL_ROOT, ALGO_DISABLE_OOM_PREFLIGHT=$ALGO_DISABLE_OOM_PREFLIGHT, ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M) ..."
     mkdir -p "$(dirname "$OUTPUT_BASE_DIR")"
 
-    export OUTPUT_BASE_DIR LOG_LEVEL PORT MODEL_ROOT
+    # 同时 export 一份,启动后用 /proc/<pid>/environ 校验 env 真的进了子进程
+    export OUTPUT_BASE_DIR LOG_LEVEL PORT MODEL_ROOT ALGO_DISABLE_OOM_PREFLIGHT ALGO_DBSCAN_VOXEL_M
     nohup "$PY" -m uvicorn scripts.service.api_server:app \
         --host 0.0.0.0 --port "$PORT" --workers 1 \
         > "$LOG_FILE" 2>&1 &
@@ -57,6 +67,20 @@ start_service() {
     # 校验:进程是否真在跑 + 健康检查
     if kill -0 "$pid" 2>/dev/null; then
         echo "PID: $pid  (日志: $LOG_FILE)"
+        # 强校验:启动后一定要能从 /proc 看到 env,避免 export 写错或子进程丢 env
+        local env_ok=1
+        if grep -q "^ALGO_DISABLE_OOM_PREFLIGHT=$ALGO_DISABLE_OOM_PREFLIGHT$" /proc/$pid/environ 2>/dev/null; then
+            echo "env OK: ALGO_DISABLE_OOM_PREFLIGHT=$ALGO_DISABLE_OOM_PREFLIGHT"
+        else
+            echo "WARNING: ALGO_DISABLE_OOM_PREFLIGHT not in /proc/$pid/environ"
+            env_ok=0
+        fi
+        if grep -q "^ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M$" /proc/$pid/environ 2>/dev/null; then
+            echo "env OK: ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M"
+        else
+            echo "WARNING: ALGO_DBSCAN_VOXEL_M not in /proc/$pid/environ"
+            env_ok=0
+        fi
         if command -v curl > /dev/null; then
             local health
             health=$(curl -s "http://localhost:$PORT/healthz" || true)

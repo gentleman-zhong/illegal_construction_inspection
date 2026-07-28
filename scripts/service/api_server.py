@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -70,8 +71,6 @@ try:
     from algo_config import DBSCAN_VOXEL_M as _ALGO_DBSCAN_VOXEL_M                         # noqa: E402
     _PREFLIGHT_OK = True
 except Exception as _preflight_exc:  # pragma: no cover
-    log.warning("pre-flight memory estimator unavailable, "
-                "submit-time early-reject disabled: %s", _preflight_exc)
     _PREFLIGHT_OK = False
 
 
@@ -80,6 +79,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("api_server")
+
+
+# Opt-out: set ALGO_DISABLE_OOM_PREFLIGHT=1 to skip the submit-time
+# memory early-reject entirely. Use when the b3dm scan itself is slow
+# (e.g., 30s+ NFS walks of city-scale tilesets) and you'd rather get a
+# clean RuntimeError from stage_convert than wait on every submit for a
+# warning that degrades to fail-open anyway. Read here (after
+# ``logging.basicConfig``) so the warning lands in the same handler
+# config as the rest of api_server logs.
+if os.getenv("ALGO_DISABLE_OOM_PREFLIGHT", "").lower() in ("1", "true", "yes"):
+    log.warning("ALGO_DISABLE_OOM_PREFLIGHT set — submit-time OOM "
+                "early-reject disabled (stage_convert still checks "
+                "cgroup limit in-pipeline)")
+    _PREFLIGHT_OK = False
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -361,6 +374,73 @@ def _archive_metadata(out_dir: Path, task_id: str,
     except OSError as e:
         log.warning("could not write request metadata %s: %s",
                     out_dir / "request.json", e)
+# --------- pre-flight (timeout-bounded) ---------
+
+# Pre-flight scans the leaf b3dm files of the base model to estimate
+# B's point count; the algorithm rejects submissions where the
+# predicted Stage 4 peak would blow past 80% of the cgroup memory cap.
+#
+# Filesystem hazard: the underlying ``open()`` / ``read()`` on a b3dm
+# can block in kernel space if the mount is slow or the NFS/RPC
+# server stops responding. A Python-level ``try/except timeout`` is
+# useless here — the thread is uninterruptibly in state ``D`` until
+# the kernel gets the RPC reply.
+#
+# Fix: run the pre-flight in a daemon thread and ``thread.join(timeout)``.
+# On timeout we log a WARNING and *fail-open* — skip the OOM early-reject
+# and let the task reach ``store.submit()``. The subprocess itself
+# re-checks the memory estimate at Stage 4 entry (see
+# ``run_pipeline.stage_convert`` / ``_estimate_peak_gib``), so even if
+# we let a too-big task through, it still surfaces a clean
+# ``RuntimeError("OOM: ...")` ` errorMessage instead of hanging the API.
+#
+# Override the budget via env: ``PREFLIGHT_TIMEOUT_S=60 uvicorn ...``.
+_DEFAULT_PREFLIGHT_TIMEOUT_S = 30.0
+
+
+def _count_b3dm_vertices(base_path: Path) -> int:
+    """Header-only b3dm scan that returns total vertex count.
+
+    Raises whatever ``find_leaf_b3dms_with_bbox`` /
+    ``b3dm_position_count`` raises; the caller wraps in try/except.
+    """
+    leaves = find_leaf_b3dms_with_bbox(base_path)
+    n_b = 0
+    for leaf_path, _ in leaves:
+        n_b += b3dm_position_count(leaf_path)
+    return n_b
+
+
+def _preflight_with_timeout(base_path: Path, timeout_s: float
+                            ) -> dict:
+    """Run the b3dm vertex scan with a wall-clock budget.
+
+    Returns one of:
+      ``{"status": "ok",       "n_b": int}``
+      ``{"status": "timeout"}``
+      ``{"status": "error",    "exc": BaseException}``
+
+    The thread is daemon=True: if it is still running when timeout fires
+    (e.g., because the kernel I/O is in state D), it won't block process
+    exit, and won't block subsequent submissions — it's a bounded leak
+    on shutdown that goes away when uvicorn restarts. In practice the
+    leaked thread is harmless (no shared state, no FDs).
+    """
+    out: dict = {"status": "ok", "n_b": 0}
+    def worker() -> None:
+        try:
+            out["n_b"] = _count_b3dm_vertices(base_path)
+        except BaseException as exc:  # noqa: BLE001 — best-effort scan
+            out["status"] = "error"
+            out["exc"] = exc
+
+    t = threading.Thread(target=worker, name=f"preflight-{base_path.name}",
+                         daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        out["status"] = "timeout"
+    return out
 
 
 # --------- routes ---------
@@ -419,14 +499,38 @@ def submit(req: SubmitRequest) -> dict:
     # "almost certainly OOMs given the current cgroup limit". A pass
     # does NOT guarantee success (other stages can still spike), but
     # it means the silent rc=-9 SIGKILL path becomes a clean 500 with
-    # a readable errorMessage. Failure of the pre-flight itself (e.g.
-    # a malformed tileset) is best-effort: we log warning + proceed.
-    if _PREFLIGHT_OK:
-        try:
-            leaves = find_leaf_b3dms_with_bbox(base_path)
-            n_b = 0
-            for leaf_path, _ in leaves:
-                n_b += b3dm_position_count(leaf_path)
+    # a readable errorMessage.
+    #
+    # Wall-clock budget: ``PREFLIGHT_TIMEOUT_S`` (default 30s) bounds
+    # the scan via ``_preflight_with_timeout``. If the b3dm scan blocks
+    # on the underlying filesystem (e.g., NFS/RPC wedged — kernel-side
+    # state D, where Python signals cannot interrupt), we degrade
+    # **fail-open** (skip the early-reject and let the task reach
+    # ``store.submit()``). The subprocess re-checks the same memory
+    # estimate at Stage 4 entry, so even on a too-big submission the
+    # outcome is a clean ``RuntimeError("OOM: ...")`` errorMessage —
+    # **never** a hung API request that strands the backend caller.
+    try:
+        _preflight_timeout_s = float(
+            os.getenv("PREFLIGHT_TIMEOUT_S", _DEFAULT_PREFLIGHT_TIMEOUT_S)
+        )
+    except (TypeError, ValueError):
+        _preflight_timeout_s = _DEFAULT_PREFLIGHT_TIMEOUT_S
+    if _PREFLIGHT_OK and _preflight_timeout_s > 0:
+        pf = _preflight_with_timeout(base_path, _preflight_timeout_s)
+        if pf["status"] == "timeout":
+            log.warning(
+                "[%s] pre-flight timed out after %.1fs; "
+                "proceeding WITHOUT OOM early-reject "
+                "(in-pipeline check still runs in stage_convert)",
+                req.taskId, _preflight_timeout_s,
+            )
+        elif pf["status"] == "error":
+            # Best-effort: a malformed tileset must NOT 500 the submission.
+            log.warning("[%s] pre-flight failed (proceeding): %s",
+                        req.taskId, pf["exc"])
+        else:
+            n_b = pf["n_b"]
             # 5% empirical diff ratio on urban SfM (B - A; the B tileset
             # has both new buildings + dropped trees after Stage 2 mask).
             n_diff_est = max(1, int(n_b * 0.05))
@@ -448,12 +552,6 @@ def submit(req: SubmitRequest) -> dict:
                     f"~5% change-ratio). Set ALGO_DBSCAN_VOXEL_M=0 to "
                     f"disable decimation, or run on a host with more memory.",
                 )
-        except Exception as pf_exc:
-            # Pre-flight is best-effort. A failure here must NOT 500 the
-            # submission — the subprocess still has its own in-pipeline
-            # check. Log and proceed.
-            log.warning("[%s] pre-flight failed (proceeding): %s",
-                        req.taskId, pf_exc)
 
     try:
         store.submit(

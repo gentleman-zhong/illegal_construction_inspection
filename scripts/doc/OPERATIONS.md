@@ -162,7 +162,7 @@ tail -f /tmp/uvicorn.log
 | `LOG_LEVEL` | `INFO` | Python logging 级别（`DEBUG` / `INFO` / `WARNING`） |
 | `OSS_CONFIG` | `scripts/service/oss_config.json` | OSS 配置文件路径（绝对 / 相对均可） |
 | `MAX_CONCURRENT_TASKS` | `4`（或在 `oss_config.json` 里设 `max_concurrent_tasks`） | 同时跑的 task 数；env 覆盖 config。`1` = 单飞（向后兼容旧版） |
-| `ALGO_DBSCAN_VOXEL_M` | `0.5` | Stage 4 DBSCAN 输入下采样体素边长（米）。`0.5` 把 B 模型（5.9 GB / 54.7 M 点）的 Stage 4 峰值 RSS 从 ~50 GiB 降到 ~6–8 GiB。设 `0` 关闭下采样（旧行为，可能 OOM）；设 `0.3` 更精细但 cluster 数可能变多。详见 §7.5。 |
+| `ALGO_DBSCAN_VOXEL_M` | `0.1` | Stage 4 DBSCAN 输入下采样体素边长（米）。`0.1` 在 64 GiB cgroup 下 Stage 4 峰值 RSS 约 ~25–35 GiB（取决于 B 模型规模），把代表点从 ~10 M 裁到 ~500 k 同时保留较精细的 cluster 形状；老默认 `0.5` 走更激进的下采样（峰值 ~6–8 GiB，但 hull/bbox 形状被 NN-tiled 锯齿化）。设 `0` 关闭下采样（旧行为，可能 OOM）。详见 §7.5。 |
 
 `PUBLIC_BASE_URL` **已废弃**（v0.5 起）：响应里的 `3dtilesUrl` / `instanceJsonUrl` 来自 OSS 配置（`oss_config.json` 的 `public_base`），不再由环境变量控制。
 
@@ -512,13 +512,13 @@ rm -rf /home/zhangzhong/illegal_construction_inspection/dataset_output/tmp/<task
 | 日志 `callback delivered (attempt N, status=200)` 看不到，但任务已 SUCCESS | 回调跑了 → 成功送达 200 | 正常，无需处理 |
 | 日志 `callback attempt N/3 failed: ...` 一连 3 条，最后 `callback failed after 3 attempts` | 后端回调 URL 不可达 / 后端 handler 报错 / 网络抖动 | 检查后端 `192.168.4.20:8088` 是否可达；后端 handler 日志有无 4xx/5xx；任务状态仍 `SUCCESS`（polling 是 source of truth），后端通过 GET 自愈 |
 | 后端完全没收到回调，但状态对 | 回调丢失（服务重启 / 进程被杀 / 网络断） | 正常设计——主路径是 GET 轮询；下次 GET 即恢复 |
-| OOM / Python 进程被杀 | tileset 太大，算法 Pass 2 吃满 CPU + 内存 | 见 §7.5 详细排查；v0.8+ 默认开启 DBSCAN 体素下采样（`ALGO_DBSCAN_VOXEL_M=0.5`），B 模型峰值 RSS 已从 ~50 GiB 降到 ~6–8 GiB |
+| OOM / Python 进程被杀 | tileset 太大，算法 Pass 2 吃满 CPU + 内存 | 见 §7.5 详细排查；v0.8+ 默认开启 DBSCAN 体素下采样（`ALGO_DBSCAN_VOXEL_M=0.1`），B 模型峰值 RSS 已从 ~50 GiB 降到 ~25–35 GiB |
 
 ### 7.5 OOM 排查（`exit code -9` / cgroup OOM-killer）
 
 2026-07 之前的 OOM 是 "幽灵"：cgroup OOM-killer 发送 `SIGKILL`，Python 拿不到任何异常，`<out>/error.log` 空白，`status.json` 卡在 `progress=80`。v0.8+ 做了三层防护：
 
-1. **算法层（根治）**：`scripts/algorithm/convert_point_ecef_and_3dtiles.py:cluster_instances` 在 `open3d.cluster_dbscan` 之前用体素下采样（默认 `ALGO_DBSCAN_VOXEL_M=0.5`）把输入从 ~10 M 点降到 ~50–80 k 极代表点，cKDTree 回投标签。Stage 4 峰值 RSS 从 ~50 GiB 降到 ~6–8 GiB，64 GiB cgroup 限制下 4 路并发都安全。
+1. **算法层（根治）**：`scripts/algorithm/convert_point_ecef_and_3dtiles.py:cluster_instances` 在 `open3d.cluster_dbscan` 之前用体素下采样（默认 `ALGO_DBSCAN_VOXEL_M=0.1`）把输入从 ~10 M 点降到 ~500 k 代表点，cKDTree 回投标签。Stage 4 峰值 RSS 从 ~50 GiB 降到 ~25–35 GiB，64 GiB cgroup 限制下 2–3 路并发安全；老默认 `0.5` 更激进（峰值 ~6–8 GiB，4 路并发），但 hull/bbox 形状被 NN-tiled 锯齿化。
 2. **算法层（清晰报错）**：`stage_convert` 入口跑 `_estimate_peak_gib(...)`，超 cgroup 80% 时 `RuntimeError("OOM: expected peak X GiB > 80% of cgroup limit Y GiB ...")`，被 `errorMessage` 透传给后端。
 3. **服务层（兜底识别）**：`task_manager._reader_loop` 在 `rc < 0` 时显式标注 `SIGKILL` (rc=-9) / `SIGABRT` (rc=-6)，给 `errorMessage` 拼上前缀：
    ```
@@ -535,18 +535,17 @@ rm -rf /home/zhangzhong/illegal_construction_inspection/dataset_output/tmp/<task
 2. 进容器，看 `cat /sys/fs/cgroup/memory.events`：`oom_kill` 计数器 > 0 就是它干的。
 3. 看子进程输出里有没有 `[rss] peak RSS = X.X GiB`（每次任务结束都打一条）。`X > 0.8 × cgroup_max_GiB` 就是预料之中的 OOM。
 4. 处置：
-   - **首选**：不动 `ALGO_DBSCAN_VOXEL_M`（默认 `0.5` 已经能跑 B），先看是不是 cgroup 限额太紧（`docker inspect` 看 `Memory`）。
-   - **小 cluster 边界变粗**：设 `ALGO_DBSCAN_VOXEL_M=0.3`（更精细，cluster 数可能更多）。
-   - **极稀疏点云**（NN > 0.5 m）：设 `ALGO_DBSCAN_VOXEL_M=0`，跳过下采样（旧行为）。
-   - **真要跑超 B 尺寸**（>100 M 点）：先扩 cgroup（`--memory=128g`），同时把 `ALGO_DBSCAN_VOXEL_M=0.7` 或更高，让 RSS 进一步降。
+   - **首选**：不动 `ALGO_DBSCAN_VOXEL_M`（默认 `0.1` 已经能跑 B 同时保留较精细的 cluster 形状），先看是不是 cgroup 限额太紧（`docker inspect` 看 `Memory`）。
+   - **需要更低内存峰值**（超大规模 tileset / cgroup < 64 GiB）：设 `ALGO_DBSCAN_VOXEL_M=0.3` 或 `0.5`（cluster 形状更锯齿化，但峰值 ~6–8 GiB）。
+   - **极稀疏点云**（NN > 0.5 m）或对精度极度敏感：设 `ALGO_DBSCAN_VOXEL_M=0`，跳过下采样（旧行为，~50 GiB 峰值）。
 
 **已知 cgroup 限额参考：**
 
-| 部署 | `--memory=` | `--memory-swap=` | B 模型峰值（默认 `VOXEL_M=0.5`） |
-|---|---|---|---|
-| 64 GiB 容器（当前默认） | `64g` | `64g` | ~6–8 GiB，4 路并发都安全 |
-| 32 GiB 容器 | `32g` | `32g` | ~6–8 GiB，2–3 路并发 |
-| 16 GiB 容器 | `16g` | `16g` | ~6–8 GiB，1 路并发；超 B 需 `ALGO_DBSCAN_VOXEL_M=0.8` |
+| 部署 | `--memory=` | `--memory-swap=` | B 模型峰值（默认 `VOXEL_M=0.1`） | 老默认 `0.5` |
+|---|---|---|---|---|
+| 64 GiB 容器（当前默认） | `64g` | `64g` | ~25–35 GiB，2–3 路并发 | ~6–8 GiB，4 路并发 |
+| 32 GiB 容器 | `32g` | `32g` | ~25–35 GiB，1 路并发 | ~6–8 GiB，2–3 路并发 |
+| 16 GiB 容器 | `16g` | `16g` | 不够；需 `ALGO_DBSCAN_VOXEL_M≥0.5` | ~6–8 GiB，1 路并发 |
 
 **NumPy ≥ 2.0 `copy` 关键字陷阱（f32 输入下必 fail）：**
 
@@ -601,6 +600,45 @@ ecef = pts_diff @ T[:3, :3].T + T[:3, 3]   # T[:3, 3] 是平移列
 修复后与旧齐次形式 **bit-exact**（50 个随机 rigid transform × 100 随机点全部相等）。回归测试：`tests/algorithm/test_ecef_algebraic.py`，4 个 case（identity / Shanghai 真实 transform / 50 个随机 rigid / buggy form 控制），同时断言 ECEF 输出在百万米量级（ECEF 范围），不是局部米。
 
 **判定这次 bug 的方法**：跑完任务后 `jq '.clusters[0].bbox_center_ecef' output/<id>/instance.json`，值应当在 `[-3e6, 5e6, 4e6]` 量级；若只有几十到几百米 → bug 复现。
+
+**已知 bug（已修复）：pre-flight 卡死 → API 提交挂起，任务永远进入不到 `_status`**
+
+`submit()` 入口跑 `find_leaf_b3dms_with_bbox(base_path)` 扫 base 模型的 b3dm header，预估 Stage 4 内存。这个调用 `open()` / `read()` b3dm 文件，**当 mount（NFS / FUSE / 任何走 RPC 的文件系统）响应慢的时候会在内核态进入 `D` 状态（uninterruptible sleep, wchan `rpc_wa`）**——Python 信号、try/except timeout、asyncio timeout 都不起作用，因为是 syscall 在阻塞。
+
+**症状**（2026-07 多起实测）：
+- POST `/two-violation/compare` 写出了 `request.json` 但**永远不返回响应**
+- service.log 在 `resolved paths` 之后没有任何 pre-flight / spawning 日志
+- GET `/tasks/{id}` 返回 HTTP 200 + body `code:500 errorMessage:"taskId not found"`（**HTTP 200 误导**：FastAPI 默认 status 是 200，错误状态码在 JSON body 里）
+- 任务**永远**进不到 TaskStore：`store.submit()` 调用前就被卡住了
+
+**修复**（`scripts/service/api_server.py`）：
+
+新增 `_preflight_with_timeout(base_path, timeout_s)`：把 b3dm scan 放到一个 **daemon 线程**里跑，**主线程 `thread.join(timeout_s)`** 卡到超时为止。超时即返回 `{"status": "timeout"}`，submit 走 **fail-open**（跳过 OOM early-reject 直接进 `store.submit()`）。子类进程入口的 `run_pipeline.stage_convert` 有同一个 `_estimate_peak_gib` 兜底，太大的任务会在那里干净地抛 `RuntimeError("OOM: ...")` 而不是 hang 整个 API。
+
+可调超时（默认 30 s）：
+
+```bash
+PREFLIGHT_TIMEOUT_S=60 uvicorn ...     # 把超时改成 60s
+PREFLIGHT_TIMEOUT_S=0  uvicorn ...     # 关掉超时（不推荐，会回到老 bug 行为）
+```
+
+**daemon thread 善后**：超时后线程被扔在后头继续等 RPC 响应（内核 D 状态没法杀）。**这没事**——它是 daemon（不阻塞 uvicorn 退出），不持有共享状态、文件描述符、socket；最坏的情况：uvicorn 重启时一起消失。NFS wedged 恢复后该线程也会自然结束。
+
+**回归测试**：`tests/service/test_preflight_timeout.py`，4 个 case（fast scan / hanging scan / raising scan / daemon check），都用 `monkeypatch` 把 inner scan 替换成 stub，不碰真实 b3dm。
+
+**判定这次 bug 的方法**：
+
+```bash
+# 1. 看 uvicorn 是否有线程卡在 D 状态
+ps -L -p $(pgrep -f uvicorn) -o pid,tid,stat,wchan,comm | awk '$3=="D"'
+#   若有 wchan=rpc_wa / nfs_wait / fuse_await → 命中此 bug
+
+# 2. 看 service.log 该任务在 "resolved paths" 之后是否还有后续行
+grep -A20 "your-task-id.*resolved paths" service.log
+#   应当紧跟 pre-flight: n_b=...;若 30 秒内没有 → 命中此 bug（旧版本）
+```
+
+**避免**：升级到新版 `api_server.py` 后，pre-flight 30 s 还没回就直接进队，submit handler 不再挂起。
 
 ---
 
