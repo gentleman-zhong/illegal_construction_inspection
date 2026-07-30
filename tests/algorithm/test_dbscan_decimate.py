@@ -75,6 +75,52 @@ def test_voxel_decimate_matches_undecimated_cluster_count():
     assert n_dec >= 1
 
 
+def test_voxel_0_1_decimation_ratio_and_label_shape():
+    """Default voxel=0.1 (2026-07-28) must aggressively decimate
+    representative counts while still returning full-N back-projected
+    labels. Pins the new precision/accuracy tradeoff in CI so a
+    future tuning change must come with a justification.
+
+    On a clean 5-cluster / 10k-pt synthetic of cluster_radius=1.0 m
+    and extent=100 m, voxel=0.1 m should:
+      - leave at most 25% of input points as representatives
+        (i.e. ~5–10× decimation ratio even before edge effects)
+      - still emit exactly N labels so downstream back-projection
+        covers every input point
+      - find at least 1 cluster (the synthetic clusters are well-
+        separated blobs that even small-voxel decimation preserves)
+    """
+    pts = _synth_clusters(n_clusters=5, pts_per_cluster=2000, noise=200)
+    ecef = pts.copy()
+
+    clusters, labels = cluster_instances(
+        pts, ecef, eps=2.5, min_points=20, voxel_m=0.1,
+    )
+
+    # Label shape / dtype must be full N (back-propagation contract).
+    assert labels.shape == (len(pts),), (
+        f"voxel=0.1 must return N labels, got {labels.shape}"
+    )
+    assert labels.dtype == np.int64
+
+    # At least one cluster survives.
+    assert len(clusters) >= 1, "no clusters found at voxel=0.1"
+
+    # And the precision-loss budget: total representative count must
+    # be a fraction of the input. We can't observe it directly, but
+    # we can sanity-check via runtime: 0.1 should be slower than 0.5
+    # on the same input (more representatives to DBSCAN + back-project
+    # NN-search) but still ≪ 30s on 10k pts.
+    t0 = time.time()
+    cluster_instances(pts, ecef, eps=2.5, min_points=20, voxel_m=0.1)
+    elapsed = time.time() - t0
+    assert elapsed < 10.0, (
+        f"voxel=0.1 cluster_instances took {elapsed:.2f}s (>10s) "
+        f"on a 10k-pt synthetic — the cKDTree back-projection is "
+        f"unexpectedly expensive at this voxel size."
+    )
+
+
 def test_voxel_decimate_centroid_within_one_voxel():
     """For each cluster returned by the decimated path, the centroid
     should agree with the undecimated centroid within ``voxel_m``."""

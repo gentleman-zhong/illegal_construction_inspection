@@ -31,7 +31,14 @@ def _env(name: str, default: Any) -> Any:
 
 # ── Stage 1: extract_leaf_vertices ───────────────────────────────
 EXTRACT_DETECT_SAMPLES  = _env("ALGO_EXTRACT_DETECT_SAMPLES", 8)
-EXTRACT_MAX_WORKERS     = _env("ALGO_EXTRACT_MAX_WORKERS",    8)
+# v0.8-introduced regression (R2): on a 128-core box the prior ``8`` capped
+# inner-pool concurrency to ~6% of the machine, making Pass 2 wall-time scale
+# with worker count instead of CPU count. Cap at 64 (the empirical "NFS RPC
+# safe" upper bound — keeps the kernel from being asked to dispatch more
+# in-flight syscalls than it can serve against the model mount). On dev
+# machines (4-8 cores) this still bottoms out at the auto-detected count.
+EXTRACT_MAX_WORKERS     = _env("ALGO_EXTRACT_MAX_WORKERS",
+                               min(os.cpu_count() or 8, 64))
 EXTRACT_MIN_LEAVES      = _env("ALGO_EXTRACT_MIN_LEAVES",     30)
 EXTRACT_CHUNK_DIVISOR   = _env("ALGO_EXTRACT_CHUNK_DIVISOR",  16)
 

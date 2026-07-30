@@ -310,7 +310,7 @@ class TaskStore:
                out_dir: Path) -> subprocess.Popen:
         wrapper = self.scripts_dir / "run_pipeline_subprocess.py"
         cmd = [
-            sys.executable, str(wrapper),
+            sys.executable, "-u", str(wrapper),
             "--task-id",      task_id,
             "--out-dir",      str(out_dir),
             "--base-path",    base_path,

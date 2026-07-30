@@ -225,19 +225,27 @@ def read_accessor(gltf: dict, bin_payload: bytes, idx: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 def find_leaf_b3dms(tileset_root: Path) -> list[Path]:
     """Discover every leaf .b3dm by walking the tileset JSON tree."""
-    return [p for p, _ in find_leaf_b3dms_with_bbox(tileset_root)]
+    return [p for p, _, _ in find_leaf_b3dms_with_bbox(tileset_root)]
 
 
-def find_leaf_b3dms_with_bbox(tileset_root: Path) -> list[tuple[Path, list[float] | None]]:
-    """Discover every leaf .b3dm and capture its bbox center.
+def find_leaf_b3dms_with_bbox(tileset_root: Path
+                              ) -> list[tuple[Path, list[float] | None, list[float] | None]]:
+    """Discover every leaf .b3dm and capture its bbox center + half-axes.
 
-    Returns a list of ``(b3dm_path, bbox_center)`` tuples sorted by path,
-    where ``bbox_center`` is the ``[cx, cy, cz]`` slice of the leaf
-    node's ``boundingVolume.box`` (in the tile-local frame), or ``None``
-    if the leaf has no box-format boundingVolume (e.g. only a ``region``
-    volume is provided — uncommon for osgb2tiles3 output).
+    Returns a list of ``(b3dm_path, bbox_center, bbox_extents)`` tuples
+    sorted by path. ``bbox_center`` is the ``[cx, cy, cz]`` slice of the
+    leaf node's ``boundingVolume.box`` (in the tile-local frame) and
+    ``bbox_extents`` is ``[hx, hy, hz]`` (the half-axis lengths from
+    ``box[3:6]``). Either may be ``None`` if the leaf has no
+    box-format boundingVolume (e.g. only a ``region`` volume is
+    provided — uncommon for osgb2tiles3 output).
+
+    The center + extents together form an axis-aligned bbox in B's local
+    frame, used by ``stage_extract`` to pre-filter leaves against the
+    ROI polygon (R1 in the v0.8-regression plan) without parsing
+    individual b3dm POSITION arrays.
     """
-    out: list[tuple[Path, list[float] | None]] = []
+    out: list[tuple[Path, list[float] | None, list[float] | None]] = []
     seen: set[Path] = set()
     ts_path = tileset_root / "tileset.json"
     if not ts_path.is_file():
@@ -255,8 +263,26 @@ def _bbox_center(node: dict) -> list[float] | None:
     return None
 
 
+def _bbox_extents(node: dict) -> list[float] | None:
+    """Half-axis lengths from ``boundingVolume.box[3:6]``.
+
+    The 3D-Tiles ``box`` is ``[cx, cy, cz, ex, ey, ez, ...]`` where the
+    six remaining slots encode an *oriented* bbox via three half-axes.
+    For most osgb2tiles3 outputs the orientation is identity (i.e. the
+    box is axis-aligned), so the half-axes read as plain (hx, hy, hz).
+    A few tilesets carry mild rotation — we keep the conservative
+    XY-only check downstream (z extent is unused for the ROI polygon
+    containment which is 2D in B's local ENU).
+    """
+    bv = node.get("boundingVolume", {})
+    box = bv.get("box")
+    if isinstance(box, list) and len(box) >= 6:
+        return [float(box[3]), float(box[4]), float(box[5])]
+    return None
+
+
 def _walk_tree(node: dict, ref_dir: Path,
-               out: list[tuple[Path, list[float] | None]],
+               out: list[tuple[Path, list[float] | None, list[float] | None]],
                seen: set[Path]) -> None:
     content = node.get("content")
     children = node.get("children", [])
@@ -281,28 +307,36 @@ def _walk_tree(node: dict, ref_dir: Path,
         if sub_content is not None and not sub_root.get("children"):
             uri2 = sub_content.get("uri", "")
             if uri2.endswith(".b3dm"):
-                _try_record(sub_path.parent / uri2, _bbox_center(sub_root), out, seen)
+                _try_record(sub_path.parent / uri2,
+                            _bbox_center(sub_root),
+                            _bbox_extents(sub_root),
+                            out, seen)
     elif uri.endswith(".b3dm"):
         if children:
             for c in children:
                 _walk_tree(c, ref_dir, out, seen)
         else:
-            _try_record(ref_dir / uri, _bbox_center(node), out, seen)
+            _try_record(ref_dir / uri,
+                        _bbox_center(node),
+                        _bbox_extents(node),
+                        out, seen)
     else:
         warnings.warn(f"unsupported content.uri extension: {uri!r}")
         for c in children:
             _walk_tree(c, ref_dir, out, seen)
 
 
-def _try_record(p: Path, bbox_center: list[float] | None,
-               out: list[tuple[Path, list[float] | None]],
+def _try_record(p: Path,
+               bbox_center: list[float] | None,
+               bbox_extents: list[float] | None,
+               out: list[tuple[Path, list[float] | None, list[float] | None]],
                seen: set[Path]) -> None:
     rp = p.resolve()
     if rp in seen:
         return
     if rp.is_file():
         seen.add(rp)
-        out.append((rp, bbox_center))
+        out.append((rp, bbox_center, bbox_extents))
     else:
         warnings.warn(f"missing leaf b3dm: {rp}")
 
@@ -441,6 +475,7 @@ def extract_point_cloud(
     detect_samples: int = 8,
     with_color: bool = True,
     workers: int = 0,
+    keep_paths: list[Path] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, list[float],
            tuple[tuple[int, int, int], tuple[int, int, int]]]:
     """Walk the tileset tree, extract ENU POSITION (+ optional COLOR) from every leaf b3dm.
@@ -479,6 +514,11 @@ def extract_point_cloud(
         avoid fork-overhead dominating the wall time. The pool uses
         ``fork`` so workers inherit the parent's already-imported
         modules (PIL, numpy, plyfile) — Linux only.
+    keep_paths : list[Path] | None
+        If supplied, skip the JSON-tree walk and only extract from
+        these paths (in that order). Used by ``stage_extract`` after
+        the ROI polygon pre-filter to skip leaves whose bbox lies
+        entirely outside the ROI (R1 in the v0.8 regression fix).
 
     Returns
     -------
@@ -499,18 +539,46 @@ def extract_point_cloud(
         the source b3dm axis for output axis ``k``; ``signs[k]`` is ±1.
     """
     root = Path(tileset_root)
-    leaves = find_leaf_b3dms_with_bbox(root)
-    if not leaves:
-        raise RuntimeError(f"No leaf b3dms found under {root}")
+    if keep_paths is not None:
+        # The caller has already done the bbox-vs-ROI filter; build a
+        # synthetic leaves list using the same 3-tuple shape as
+        # ``find_leaf_b3dms_with_bbox``. Without a bbox Pass 0 cannot
+        # choose axis-mapping samples, so we re-run a lightweight bbox
+        # discovery on the kept paths to recover the centres.
+        if not keep_paths:
+            raise RuntimeError(
+                f"keep_paths is empty after ROI bbox pre-filter under {root}; "
+                "check ROI polygon vs tileset extent"
+            )
+        # Look up bboxes in batch via re-walking the tileset (cheap,
+        # ~few hundred ms total for 10k leaves). Could be optimized
+        # later by passing the bboxes in directly.
+        bboxes: dict[Path, list[float] | None] = {
+            p: bc for (p, bc, _bx) in find_leaf_b3dms_with_bbox(root)
+        }
+        leaves = [(p, bboxes.get(p), None) for p in keep_paths]
+        # For leaves that fall outside the tileset's bbox index (e.g.
+        # an external Path), drop gracefully to ``(p, None, None)`` —
+        # Pass 0 will skip them with ``if bbox is None: continue``.
+        leaves = [
+            (p, bc, be) if bc is not None else (p, None, None)
+            for (p, bc, be) in leaves
+        ]
+    else:
+        leaves = find_leaf_b3dms_with_bbox(root)
+        if not leaves:
+            raise RuntimeError(f"No leaf b3dms found under {root}")
 
     transform = load_root_transform(root)
 
     bar = (lambda it, **kw: tqdm(it, **kw)) if (progress and _HAVE_TQDM) else (lambda it, **kw: it)
 
     # Pass 0: detect axis mapping on the first detect_samples leaves
-    # that have a usable bbox.
+    # that have a usable bbox. The leaves tuple shape is 3-tuple
+    # ``(path, bbox_center_3, bbox_extents_3)``; we ignore the
+    # extents here (axis-mapping only needs the center).
     samples: list[tuple[np.ndarray, list[float]]] = []
-    for path, bbox in leaves:
+    for path, bbox, _bx in leaves:
         if bbox is None:
             continue
         b = parse_b3dm(path)
@@ -534,7 +602,7 @@ def extract_point_cloud(
     # Pass 1: count (header-only — skip the BIN chunk entirely)
     counts = np.empty(len(leaves), dtype=np.int64)
     for i in bar(range(len(leaves)), total=len(leaves), desc="count  ", unit="tile"):
-        path, _ = leaves[i]
+        path, _, _ = leaves[i]
         counts[i] = _b3dm_position_count(path)
 
     # Pass 2: extract POSITION (+ COLOR) + apply axis mapping
@@ -565,7 +633,7 @@ def extract_point_cloud(
         tile_args = [
             (path, int(offsets[i]), int(offsets[i + 1]),
              axis_mapping, with_color)
-            for i, (path, _) in enumerate(leaves)
+            for i, (path, _, _) in enumerate(leaves)
         ]
         # Use ProcessPoolExecutor (instead of multiprocessing.Pool)
         # because its worker processes are non-daemonic — ``stage_extract``
@@ -607,7 +675,7 @@ def extract_point_cloud(
                      unit="tile"):
             start = int(offsets[i])
             end = int(offsets[i + 1])
-            path, _ = leaves[i]
+            path, _, _ = leaves[i]
             b = parse_b3dm(path)
             prim = _first_primitive(b.gltf)
             pos_idx = prim["attributes"]["POSITION"]

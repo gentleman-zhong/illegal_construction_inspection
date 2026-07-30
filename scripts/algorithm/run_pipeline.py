@@ -32,7 +32,6 @@ import argparse
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -46,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from point_cloud_extraction import (  # noqa: E402
     extract_point_cloud,
+    find_leaf_b3dms_with_bbox,
     load_root_transform,
 )
 from filter_vegetation import (  # noqa: E402
@@ -78,6 +78,7 @@ from algo_config import (                            # noqa: E402
     DBSCAN_VOXEL_M,
     DTM_GRID_RES,
     EXG_THRESHOLD,
+    EXTRACT_MAX_WORKERS,
     MAX_VEG_HEIGHT_M,
     MIN_VEG_HEIGHT_M,
     NN_LEAFSIZE,
@@ -208,17 +209,70 @@ def _run_stage(label: str, fn: Callable[..., Any],
 # =============================================================================
 # Stage 1: extract POSITION + RGB from both 3D Tiles roots (in memory)
 # =============================================================================
-def _extract_one_tileset_for_pool(tileset_root: Path):
-    """Pool-friendly wrapper around ``extract_point_cloud``.
+class _RoiBboxFilter:
+    """Cheap bbox-vs-ROI-polygon test, conservative (never drops a tile
+    that *might* hit the ROI).
 
-    Module-level (no closure state) so ``ProcessPoolExecutor`` can
-    pickle the reference when fan-out runs in a ``spawn`` context.
-    Pinned kwargs match what ``stage_extract`` historically passed
-    when calling inline.
+    Used by ``stage_extract`` to skip leaves whose bbox lies entirely
+    outside the user-supplied ROI polygon. This is the R1 fix in the
+    v0.8 regression plan: previously ``extract_point_cloud`` ran on
+    *every* leaf b3dm even when the ROI subset would have been 1-2% of
+    the world, leaving Pass 2 to do ~50× the work needed.
+
+    The two-step check is:
+
+    1. **AABB rejection** — if the tile's XY bbox is fully outside the
+       polygon's XY bbox, it's geographically irrelevant and we skip
+       it without further work.
+    2. **Corner ray-cast** — for tiles that overlap the ROI's AABB,
+       feed the 4 bbox corners through ``points_in_polygon`` (vectorised
+       ray-cast). If at least one corner is inside the polygon we keep
+       the tile; otherwise we skip.
+
+    The "any corner inside ⇒ keep" rule is intentionally the *opposite*
+    of the natural inverse reading: a tile whose bbox is 50 m wide but
+    whose 4 corners all land outside a 4-vertex polygon could still
+    overlap the polygon diagonally, and conservative keeping is much
+    cheaper than catching the false-negative later.
     """
-    return extract_point_cloud(
-        tileset_root, progress=False, with_color=True,
-    )
+
+    __slots__ = ("poly", "poly_bbox_lo", "poly_bbox_hi")
+
+    def __init__(self, polygon_xy_enu: np.ndarray):
+        self.poly = polygon_xy_enu
+        self.poly_bbox_lo = polygon_xy_enu.min(axis=0)
+        self.poly_bbox_hi = polygon_xy_enu.max(axis=0)
+
+    def is_outside(self, bbox_xy_e: np.ndarray, bbox_xy_n: np.ndarray,
+                   extents: tuple[float, float]) -> bool:
+        """True iff the tile's bbox is *fully* outside the polygon.
+
+        ``bbox_xy_e`` / ``bbox_xy_n`` are the bbox *centre* in B's
+        local ENU (after projecting the A-frame centre through
+        ``T = inv(T_b) @ T_a``); ``extents`` are half-axis lengths
+        ``(hx, hy)`` from ``boundingVolume.box[3:5]``.
+        """
+        cx, cy = float(bbox_xy_e), float(bbox_xy_n)
+        hx, hy = extents
+        lo_x, lo_y = cx - hx, cy - hy
+        hi_x, hi_y = cx + hx, cy + hy
+
+        # 1) AABB rejection
+        if (hi_x < self.poly_bbox_lo[0]
+                or lo_x > self.poly_bbox_hi[0]
+                or hi_y < self.poly_bbox_lo[1]
+                or lo_y > self.poly_bbox_hi[1]):
+            return True
+
+        # 2) conservative 4-corner ray-cast
+        corners = np.array(
+            [[lo_x, lo_y], [lo_x, hi_y], [hi_x, hi_y], [hi_x, lo_y]],
+            dtype=np.float64,
+        )
+        inside = points_in_polygon(
+            corners[:, 0], corners[:, 1], self.poly,
+        )
+        return not bool(inside.any())
 
 
 def stage_extract(tileset_a: Path, tileset_b: Path, inter_dir: Path | None,
@@ -261,36 +315,142 @@ def stage_extract(tileset_a: Path, tileset_b: Path, inter_dir: Path | None,
     cpu = os.cpu_count() or 1
     use_parallel = cpu >= PARALLEL_CPU_THRESHOLD
 
-    if use_parallel:
-        # ProcessPoolExecutor (instead of multiprocessing.Pool) so its
-        # workers are non-daemonic — that lets ``extract_point_cloud``'s
-        # inner Pass-2 ProcessPoolExecutor spawn successfully from
-        # within these workers (CPython forbids daemon processes from
-        # spawning children).
-        with ProcessPoolExecutor(max_workers=2) as pool:
-            res_a, res_b = list(pool.map(
-                _extract_one_tileset_for_pool,
-                [tileset_a, tileset_b],
-            ))
-        points_a, colors_a, transform_a, _ = res_a
-        points_b, colors_b, transform_b, _ = res_b
+    # v0.8 regression fix (R1): on b-class tilesets (≥25 M points, 36 k
+    # leaves) ``extract_point_cloud`` previously ran on *every* leaf
+    # b3dm even though the ROI subset was only ~1.4% of the world — Pass
+    # 2's parse + texture-sample + alignment work on the 98.6% that
+    # would later be masked off dominated Stage 1 wall-time (~12 of the
+    # 13 min regression). Project the ROI polygon into B's local ENU
+    # *now* using ``load_root_transform`` (cheap: one tileset.json read),
+    # then route both ``extract_point_cloud`` calls through a
+    # ``keep_paths`` list filtered by the conservative bbox test.
+    keep_a: list[Path] | None = None
+    keep_b: list[Path] | None = None
+    if roi is not None and roi.area_coordinates is not None:
+        # Project the polygon using B's root transform only (cheap).
+        # This duplicates a few lines of main()'s post-stage
+        # ``polygon_to_b_enu(..., transform_b)`` call but keeps stage
+        # signature uniform. The A root transform is also pulled up
+        # here so the A-frame bbox centres can be projected into B's
+        # ENU *before* any heavy extraction runs (closure over a
+        # non-yet-bound ``transform_a`` would otherwise NameError —
+        # see error log 20260730144529AA9A7F).
+        transform_b_pre = load_root_transform(tileset_b)
+        transform_a_pre = load_root_transform(tileset_a)
+        polygon_enu_local = polygon_to_b_enu(roi.area_coordinates,
+                                            transform_b_pre)
+        roi_filter = _RoiBboxFilter(polygon_enu_local)
+
+        # Pre-compute the A→B rotation matrix once (cheap: two 4×4
+        # inversions + matmul). Used to project A's bbox centers into
+        # B's local ENU frame so the filter can test them. Both inputs
+        # are pure functions of the tileset transforms, so we capture
+        # them via default-args (not as enclosing-scope free vars, to
+        # avoid Python's late-binding NameError on first invocation).
+        T_b_mat = np.asarray(transform_b_pre, dtype=np.float64
+                             ).reshape(4, 4, order="F")
+        T_a_mat = np.asarray(transform_a_pre, dtype=np.float64
+                             ).reshape(4, 4, order="F")
+        T_local = np.linalg.inv(T_b_mat) @ T_a_mat
+
+        def _project_a_bbox_into_b(box_a, _T=T_local):
+            # box_a[:3] is the A-frame centre; project through
+            # inv(T_b) @ T_a to bring it into B's local ENU.
+            c = np.array([box_a[0], box_a[1], box_a[2], 1.0], dtype=np.float64)
+            c_b = _T @ c
+            return float(c_b[0]), float(c_b[1]), float(c_b[2])
+
+        def _filter_leaves(leaves, *, project_to_b_for_a=False):
+            kept, skipped = [], 0
+            for path, bbox_center, bbox_extents in leaves:
+                if bbox_center is None or bbox_extents is None:
+                    # No box → no choice but to keep (conservative).
+                    kept.append(path)
+                    continue
+                if project_to_b_for_a:
+                    cx, cy, cz = _project_a_bbox_into_b(bbox_center)
+                else:
+                    cx, cy, cz = bbox_center[0], bbox_center[1], bbox_center[2]
+                if roi_filter.is_outside(cx, cy, (bbox_extents[0],
+                                                  bbox_extents[1])):
+                    skipped += 1
+                    continue
+                kept.append(path)
+            return kept, skipped
+
+        # B's bbox is already in B's local ENU (origin = B's model
+        # centroid on the WGS84 surface) — no projection needed.
+        leaves_b_pre = find_leaf_b3dms_with_bbox(tileset_b)
+        keep_b, skip_b = _filter_leaves(leaves_b_pre)
+        # A's bbox is in A's local ENU; project each centre through
+        # T_local = inv(T_b) @ T_a before testing.
+        leaves_a_pre = find_leaf_b3dms_with_bbox(tileset_a)
+        keep_a, skip_a = _filter_leaves(
+            leaves_a_pre,
+            project_to_b_for_a=True,
+        )
+        print(f"[roi] stage1 bbox pre-filter:"
+              f" A kept {len(keep_a):,}/{len(leaves_a_pre):,}"
+              f" (skip {skip_a:,} = {skip_a / max(1, len(leaves_a_pre)):.1%});"
+              f" B kept {len(keep_b):,}/{len(leaves_b_pre):,}"
+              f" (skip {skip_b:,} = {skip_b / max(1, len(leaves_b_pre)):.1%})",
+              flush=True)
+        # We also stash the projected polygon on a copy so downstream
+        # code (which expects ``roi.polygon_enu``) doesn't have to redo
+        # the projection.
+        if roi.polygon_enu is None:
+            roi.polygon_enu = polygon_enu_local
     else:
+        # If polygon_enu was already set by main() (non-default stage
+        # entry path), preserve it; otherwise leave alone.
+        transform_b_pre = None
+
+    if use_parallel:
+        # v0.8 regression fix (R4): the prior 2-worker outer pool ×
+        # 8-worker inner pool = 16 process at peak on a 128-core box (~12.5%
+        # utilization) *and* stacked twice, causing NFS-RPC contention
+        # because each inner worker holds a synchronous syscall open against
+        # the model mount. We now run A and B sequentially in the main
+        # process — the inner pool (which is sized by EXTRACT_MAX_WORKERS,
+        # see algo_config) already exposes fan-out up to ``min(cpu, 64)``,
+        # so the outer pool added no extra parallelism, only contention.
+        # Stage 2-4 see only the ROI-masked ~360 k points, so total
+        # wall-time here is dominated by max(A, B), not A+B.
         points_a, colors_a, transform_a, _ = extract_point_cloud(
-            tileset_a, progress=False, with_color=True,
+            tileset_a, progress=True, with_color=True,
+            workers=EXTRACT_MAX_WORKERS, keep_paths=keep_a,
         )
         points_b, colors_b, transform_b, _ = extract_point_cloud(
-            tileset_b, progress=False, with_color=True,
+            tileset_b, progress=True, with_color=True,
+            workers=EXTRACT_MAX_WORKERS, keep_paths=keep_b,
+        )
+    else:
+        points_a, colors_a, transform_a, _ = extract_point_cloud(
+            tileset_a, progress=True, with_color=True,
+            workers=EXTRACT_MAX_WORKERS, keep_paths=keep_a,
+        )
+        points_b, colors_b, transform_b, _ = extract_point_cloud(
+            tileset_b, progress=True, with_color=True,
+            workers=EXTRACT_MAX_WORKERS, keep_paths=keep_b,
         )
 
     T_a = np.asarray(transform_a, dtype=np.float64).reshape(4, 4, order="F")
     T_b = np.asarray(transform_b, dtype=np.float64).reshape(4, 4, order="F")
     T = np.linalg.inv(T_b) @ T_a          # A's ENU -> B's ENU
 
-    pts_a_h = np.hstack([
-        points_a.astype(np.float64, copy=False),
-        np.ones((len(points_a), 1), dtype=np.float64),
-    ])
-    points_a_in_b = (pts_a_h @ T.T)[:, :3].astype(np.float32, copy=False)
+    # v0.8 regression fix (R3): Stage 1's ``points_a`` is now f32 (it used
+    # to be f64), so the previous ``astype(f64, copy=False) + ones + @``
+    # block stopped being a zero-copy view and became ~1.7 GB of throwaway
+    # allocations per 25 M points. Compute the same affine directly in f32:
+    #   (hstack([A;1]) @ T.T)[:, :3]  ==  A @ T[:3,:3].T + T[:3,3]
+    # which avoids the f64 promotion, the ``ones`` column, and the matmul
+    # output down-cast entirely. f32 ENU error is ~1e-5 m at 1 km, far
+    # below NN `1.5 m` and DBSCAN `eps=3.0`.
+    T_f32 = np.asarray(T, dtype=np.float32)
+    points_a_in_b = (
+        points_a.astype(np.float32, copy=False) @ T_f32[:3, :3].T
+        + T_f32[:3, 3]
+    ).astype(np.float32, copy=False)
 
     # Trace the alignment shift so the user can spot a mis-pair.
     shift = (points_a_in_b.mean(axis=0) - points_b.mean(axis=0))
