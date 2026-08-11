@@ -40,7 +40,7 @@ EXTRACT_DETECT_SAMPLES  = _env("ALGO_EXTRACT_DETECT_SAMPLES", 8)
 EXTRACT_MAX_WORKERS     = _env("ALGO_EXTRACT_MAX_WORKERS",
                                min(os.cpu_count() or 8, 64))
 EXTRACT_MIN_LEAVES      = _env("ALGO_EXTRACT_MIN_LEAVES",     30)
-EXTRACT_CHUNK_DIVISOR   = _env("ALGO_EXTRACT_CHUNK_DIVISOR",  16)
+EXTRACT_CHUNK_DIVISOR   = _env("ALGO_EXTRACT_CHUNK_DIVISOR",  8)
 
 # ── Stage 2: filter_vegetation ───────────────────────────────────
 CSF_CLOTH_RESOLUTION    = _env("ALGO_CSF_CLOTH_RESOLUTION",    2.0)

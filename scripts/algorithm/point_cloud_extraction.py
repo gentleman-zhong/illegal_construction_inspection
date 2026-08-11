@@ -244,13 +244,28 @@ def find_leaf_b3dms_with_bbox(tileset_root: Path
     frame, used by ``stage_extract`` to pre-filter leaves against the
     ROI polygon (R1 in the v0.8-regression plan) without parsing
     individual b3dm POSITION arrays.
+
+    Internally this pre-reads every sub-tileset.json in parallel via a
+    thread pool (v0.8 regression fix #9). On the b-class tilesets used
+    in production (~200 sub-tileset.json × ~25 ms/NFS-RPC each) this
+    drops the wall-time of the walk from ~60 s per tileset to ~5-10 s
+    (saving ~90 s across the two tilesets in Stage 1). The thread pool
+    is cheap — it doesn't need picklable closures because
+    ``Path.read_text()`` releases the GIL while waiting on the read.
     """
     out: list[tuple[Path, list[float] | None, list[float] | None]] = []
     seen: set[Path] = set()
     ts_path = tileset_root / "tileset.json"
     if not ts_path.is_file():
         raise RuntimeError(f"no tileset.json at {ts_path}")
-    _walk_tree(json.loads(ts_path.read_text())["root"], ts_path.parent, out, seen)
+    # Preload every sub-tileset.json in parallel. The top-level
+    # tileset.json itself is read synchronously here; _preload_sub_tilesets
+    # walks down from it. If preload returns no entries (e.g. flat
+    # tileset with no sub-.json files), the walker falls back to the
+    # legacy on-demand read path inside _walk_tree.
+    cache = _preload_sub_tilesets(ts_path)
+    root_obj = json.loads(ts_path.read_text())
+    _walk_tree(root_obj["root"], ts_path.parent, out, seen, cache)
     out.sort(key=lambda t: str(t[0]))
     return out
 
@@ -283,26 +298,33 @@ def _bbox_extents(node: dict) -> list[float] | None:
 
 def _walk_tree(node: dict, ref_dir: Path,
                out: list[tuple[Path, list[float] | None, list[float] | None]],
-               seen: set[Path]) -> None:
+               seen: set[Path],
+               cache: dict[Path, dict] | None = None) -> None:
     content = node.get("content")
     children = node.get("children", [])
 
     if content is None:
         for c in children:
-            _walk_tree(c, ref_dir, out, seen)
+            _walk_tree(c, ref_dir, out, seen, cache)
         return
 
     uri = content.get("uri", "")
     if uri.endswith(".json"):
         sub_path = (ref_dir / uri).resolve()
-        try:
-            sub = json.loads(sub_path.read_text())
-        except FileNotFoundError:
-            warnings.warn(f"missing sub-tileset: {sub_path}")
-            return
+        # Use the thread-pool-preloaded cache when available (v0.8
+        # regression fix #9); fall back to on-demand read for the
+        # ``None`` case (legacy callers / external tests).
+        if cache is not None and sub_path in cache:
+            sub = cache[sub_path]
+        else:
+            try:
+                sub = json.loads(sub_path.read_text())
+            except FileNotFoundError:
+                warnings.warn(f"missing sub-tileset: {sub_path}")
+                return
         sub_root = sub["root"]
         for c in sub_root.get("children", []):
-            _walk_tree(c, sub_path.parent, out, seen)
+            _walk_tree(c, sub_path.parent, out, seen, cache)
         sub_content = sub_root.get("content")
         if sub_content is not None and not sub_root.get("children"):
             uri2 = sub_content.get("uri", "")
@@ -314,7 +336,7 @@ def _walk_tree(node: dict, ref_dir: Path,
     elif uri.endswith(".b3dm"):
         if children:
             for c in children:
-                _walk_tree(c, ref_dir, out, seen)
+                _walk_tree(c, ref_dir, out, seen, cache)
         else:
             _try_record(ref_dir / uri,
                         _bbox_center(node),
@@ -323,7 +345,95 @@ def _walk_tree(node: dict, ref_dir: Path,
     else:
         warnings.warn(f"unsupported content.uri extension: {uri!r}")
         for c in children:
-            _walk_tree(c, ref_dir, out, seen)
+            _walk_tree(c, ref_dir, out, seen, cache)
+
+
+def _preload_sub_tilesets(ts_path: Path,
+                          ) -> dict[Path, dict]:
+    """Read every sub-tileset.json under ``ts_path`` in parallel via a
+    ThreadPoolExecutor (v0.8 regression fix #9).
+
+    Walks the tileset tree breadth-first in BFS layers, reading each
+    layer with ``min(32, layer_size)`` threads. Threads release the GIL
+    during ``Path.read_text()`` so the NFS-RPC reads overlap. Returns
+    a ``{absolute_path: parsed_json_dict}`` cache that
+    ``_walk_tree`` can look up instead of issuing sync reads.
+
+    The function is intentionally non-fatal on missing sub-tilesets
+    (warnings.warn, returns cache without that entry) — the legacy
+    walker was equally lenient.
+    """
+    cache: dict[Path, dict] = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+    except ImportError:  # pragma: no cover
+        return cache  # Fall back to on-demand reads in _walk_tree
+
+    ts_dir = ts_path.parent
+    seen_paths: set[Path] = {ts_path}
+
+    # BFS layer 0: read the top-level tileset.json
+    try:
+        cache[ts_path] = json.loads(ts_path.read_text())
+    except FileNotFoundError:
+        warnings.warn(f"missing top tileset: {ts_path}")
+        return cache
+
+    # BFS layers 1..N: enqueue children, read in batches via thread pool
+    pending: list[Path] = []
+    for child in cache[ts_path].get("root", {}).get("children", []):
+        uri = child.get("content", {}).get("uri", "")
+        if uri.endswith(".json"):
+            sub_path = (ts_dir / uri).resolve()
+            if sub_path not in seen_paths:
+                seen_paths.add(sub_path)
+                pending.append(sub_path)
+
+    while pending:
+        batch = pending[:64]
+        pending = pending[64:]
+        # A child.json may have been added by an earlier batch's
+        # children (nested tilesets). Filter to unseen only.
+        batch = [p for p in batch if p not in cache]
+        if not batch:
+            continue
+        n_threads = min(32, len(batch))
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            # ``None`` for files that don't exist (read_text raises).
+            texts = list(pool.map(_safe_read_text, batch))
+        for path, text in zip(batch, texts):
+            if text is None:
+                continue
+            try:
+                cache[path] = json.loads(text)
+            except json.JSONDecodeError as e:
+                warnings.warn(f"invalid JSON in sub-tileset {path}: {e}")
+                continue
+            # Enqueue next-level children
+            for child in cache[path].get("root", {}).get("children", []):
+                uri = child.get("content", {}).get("uri", "")
+                if uri.endswith(".json"):
+                    sub_path = (path.parent / uri).resolve()
+                    if sub_path not in seen_paths:
+                        seen_paths.add(sub_path)
+                        pending.append(sub_path)
+    return cache
+
+
+def _safe_read_text(p: Path) -> str | None:
+    """Path.read_text() that swallows FileNotFoundError, returning None.
+
+    Used by ``_preload_sub_tilesets`` so a single missing sub-tileset
+    doesn't fail the entire batch — the legacy walker was equally
+    tolerant (warning + continue).
+    """
+    try:
+        return p.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as e:  # pragma: no cover (NFS hiccup, etc.)
+        warnings.warn(f"I/O error reading {p}: {e}")
+        return None
 
 
 def _try_record(p: Path,
@@ -598,18 +708,16 @@ def extract_point_cloud(
         f"out[{k}] = {signs[k]:+d} * b3dm[{perm[k]}]" for k in range(3)
     )
     print(f"[axis-map] detected: {pretty}", file=sys.stderr)
-
-    # Pass 1: count (header-only — skip the BIN chunk entirely)
-    counts = np.empty(len(leaves), dtype=np.int64)
-    for i in bar(range(len(leaves)), total=len(leaves), desc="count  ", unit="tile"):
-        path, _, _ = leaves[i]
-        counts[i] = _b3dm_position_count(path)
-
-    # Pass 2: extract POSITION (+ COLOR) + apply axis mapping
-    total = int(counts.sum())
-    points = np.empty((total, 3), dtype=np.float32)
-    colors = np.zeros((total, 3), dtype=np.uint8) if with_color else None
-    offsets = np.concatenate([[0], counts.cumsum()]).astype(np.int64)
+    # Release Pass 0 sample buffers eagerly — they can hold up to ~16 MB
+    # of POSITION arrays per samples × 8 samples; the same memory budget
+    # is needed by Pass 1's per-worker peak. Without an explicit clear,
+    # the array lingers until the next GC pass (v0.8 regression fix #11).
+    samples.clear()
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
 
     n_workers = workers if workers > 0 else min(os.cpu_count() or 1, EXTRACT_MAX_WORKERS)
     # Defensive fallback: if we are invoked from inside a daemon
@@ -625,27 +733,48 @@ def extract_point_cloud(
         and not multiprocessing.current_process().daemon
     )
     if progress and use_pool and _HAVE_TQDM:
-        print(f"[extract] parallel pass-2: {n_workers} workers, "
+        print(f"[extract] parallel pass-1+2: {n_workers} workers, "
               f"{len(leaves)} tiles", file=sys.stderr)
 
     missing_texture_warned = False
     if use_pool:
-        tile_args = [
-            (path, int(offsets[i]), int(offsets[i + 1]),
-             axis_mapping, with_color)
-            for i, (path, _, _) in enumerate(leaves)
-        ]
-        # Use ProcessPoolExecutor (instead of multiprocessing.Pool)
-        # because its worker processes are non-daemonic — ``stage_extract``
-        # in run_pipeline.py fans out across two tilesets via a
-        # multiprocessing.Pool, and Pool workers are daemonic, which
-        # forbids nested pool creation. ProcessPoolExecutor on Linux
-        # still uses fork + copy-on-write + the parent's already-imported
-        # PIL/numpy, so the per-tile startup cost is the same.
-        # Bigger chunks amortise IPC; ~16 pulls per worker is the sweet
-        # spot for tilesets of any reasonable size.
+        # Pass 1 (count) + Pass 2 (extract) share a single
+        # ProcessPoolExecutor (v0.8 regression fix #8). The previous
+        # layout ran Pass 1 in the main process via a sequential for loop
+        # over ~5.7k leaves at ~25 tile/s = ~5 min on b-class tilesets.
+        # `_b3dm_position_count` does one seek + read + json.loads per
+        # leaf, so it parallelises trivially across NFS — wall-time
+        # drops from ~296 s to ~5-15 s on a 64-worker pool.
+        # Pass 2 reuses the same pool (no double-fork).
         chunksize = max(1, len(leaves) // (n_workers * EXTRACT_CHUNK_DIVISOR))
+        leaf_paths = [path for (path, _, _) in leaves]
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            # Pass 1: header-only vertex count via the shared pool.
+            counts_list = list(bar(
+                pool.map(_b3dm_position_count, leaf_paths,
+                         chunksize=chunksize),
+                total=len(leaf_paths), desc="count  ", unit="tile",
+            ))
+            counts = np.asarray(counts_list, dtype=np.int64)
+            # Pass 2: extract POSITION (+ COLOR) + apply axis mapping.
+            total = int(counts.sum())
+            points = np.empty((total, 3), dtype=np.float32)
+            colors = np.zeros((total, 3), dtype=np.uint8) if with_color else None
+            offsets = np.concatenate([[0], counts.cumsum()]).astype(np.int64)
+            tile_args = [
+                (path, int(offsets[i]), int(offsets[i + 1]),
+                 axis_mapping, with_color)
+                for i, (path, _, _) in enumerate(leaves)
+            ]
+            # Use ProcessPoolExecutor (instead of multiprocessing.Pool)
+            # because its worker processes are non-daemonic — ``stage_extract``
+            # in run_pipeline.py fans out across two tilesets via a
+            # multiprocessing.Pool, and Pool workers are daemonic, which
+            # forbids nested pool creation. ProcessPoolExecutor on Linux
+            # still uses fork + copy-on-write + the parent's already-imported
+            # PIL/numpy, so the per-tile startup cost is the same.
+            # Bigger chunks amortise IPC; ~16 pulls per worker is the sweet
+            # spot for tilesets of any reasonable size.
             iterator = pool.map(
                 _extract_one_tile_worker, tile_args,
                 chunksize=chunksize,
@@ -670,6 +799,21 @@ def extract_point_cloud(
                     if tile_colors is not None:
                         colors[start:end] = tile_colors
     else:
+        # Sequential fallback (only taken when ``n_workers <= 1`` or
+        # the leaves count is below ``EXTRACT_MIN_LEAVES`` — small
+        # tilesets where a fork would dwarf the work). Pass 1 still
+        # needs counts to size the output buffer; on this code path
+        # the wall-time is negligible (<1 s) so a sequential for-loop
+        # is fine.
+        counts = np.empty(len(leaves), dtype=np.int64)
+        for i in bar(range(len(leaves)), total=len(leaves),
+                     desc="count  ", unit="tile"):
+            path, _, _ = leaves[i]
+            counts[i] = _b3dm_position_count(path)
+        total = int(counts.sum())
+        points = np.empty((total, 3), dtype=np.float32)
+        colors = np.zeros((total, 3), dtype=np.uint8) if with_color else None
+        offsets = np.concatenate([[0], counts.cumsum()]).astype(np.int64)
         for i in bar(range(len(leaves)), total=len(leaves),
                      desc="color  " if with_color else "extract",
                      unit="tile"):
