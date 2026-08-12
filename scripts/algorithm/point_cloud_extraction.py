@@ -106,6 +106,15 @@ _COMPONENT_INFO: dict[int, tuple[int, np.dtype]] = {
 _NUM_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
 
 
+class UnsupportedExtensionError(RuntimeError):
+    """Raised when a b3dm's gltf declares an extension this codebase
+    doesn't decode (e.g. ``KHR_draco_mesh_compression`` for compressed
+    POSITION accessors). Subclassing ``RuntimeError`` keeps existing
+    exception handlers that catch ``Exception`` / ``RuntimeError``
+    working while making the failure mode explicit in stack traces.
+    """
+
+
 @dataclass
 class B3dm:
     gltf: dict
@@ -116,6 +125,45 @@ def _align8(n: int) -> int:
     return n if n == 0 else ((n + 7) // 8) * 8
 
 
+def _align4(n: int) -> int:
+    """4-byte alignment — required for chunks inside the GLB binary
+    container per the glTF 2.0 spec (§ 4.2 Binary Buffer). The 3D Tiles
+    spec, by contrast, uses 8-byte alignment between FT/BT sections;
+    keep ``_align8`` for that. Confusing the two made ``parse_b3dm``
+    locate the BIN chunk 4 bytes late on tilesets where the GLB JSON
+    chunk length was a multiple of 4 but not 8 (e.g. task
+    ``20260811153934A331BD``'s ``Tile_13.b3dm``: json_chunk_len=1348
+    → align8=1352, align4=1348, real BIN at glb_off+20+1348)."""
+    return n if n == 0 else ((n + 3) // 4) * 4
+
+
+def _b3dm_section_starts(
+    ftj: int, ftb: int, btj: int, btb: int, *, padded: bool,
+) -> tuple[int, int, int, int, int]:
+    """Return ``(ftj_start, ftb_start, btj_start, btb_start, glb_off)``
+    for a b3dm container whose header begins at offset 28.
+
+    The 3D Tiles 1.0 spec mandates 8-byte alignment between sections;
+    some generators (e.g. the tool that produced task
+    ``20260811153934A331BD``) skip the padding entirely. ``padded=True``
+    follows the spec, ``padded=False`` uses raw section lengths.
+
+    FT JSON always starts at offset 28; subsequent sections are either
+    padded to 8 bytes (spec) or run back-to-back (no-pad).
+    """
+    cursor = 28
+    align = _align8 if padded else (lambda n: n)
+    ftj_start = cursor
+    ftj_end = ftj_start + align(ftj) if ftj else ftj_start
+    ftb_start = ftj_end
+    ftb_end = ftb_start + align(ftb) if ftb else ftb_start
+    btj_start = ftb_end
+    btj_end = btj_start + align(btj) if btj else ftb_end
+    btb_start = btj_end
+    btb_end = btb_start + align(btb) if btb else btj_end
+    return ftj_start, ftb_start, btj_start, btb_start, btb_end
+
+
 def _b3dm_position_count(path: Path) -> int:
     """Read only the b3dm header + GLB JSON chunk; skip the BIN chunk.
 
@@ -123,22 +171,41 @@ def _b3dm_position_count(path: Path) -> int:
     tile without paying the cost of fully parsing the b3dm (which reads
     the entire file into memory to extract the BIN payload). Skips the
     BIN chunk entirely by seeking past it after reading the GLB JSON.
+
+    Like :func:`parse_b3dm`, this probes the spec-conformant (8-byte
+    aligned) layout first and falls back to raw lengths if ``"glTF"``
+    magic isn't at the predicted offset. See :func:`parse_b3dm` for the
+    full rationale.
     """
     with path.open("rb") as f:
         head = f.read(28)
         if head[:4] != b"b3dm":
             raise ValueError(f"{path}: not a b3dm file (magic={head[:4]!r})")
-        ftj, ftb, btj, _ = struct.unpack_from("<IIII", head, 12)
-        cursor = 28
-        ftj_end = cursor + _align8(ftj)
-        ftb_end = ftj_end + _align8(ftb)
-        btj_end = ftb_end + _align8(btj)
-        btb_end = btj_end + _align8(btj)
+        ftj, ftb, btj, btb = struct.unpack_from("<IIII", head, 12)
+        # Probe spec-aligned layout, fall back to raw lengths.
+        _, _, _, _, btb_end = _b3dm_section_starts(
+            ftj, ftb, btj, btb, padded=True,
+        )
+        # Need the file's actual bytes to probe; if short file, fall back.
+        # Use a 4-byte peek at the predicted GLB offset.
+        f.seek(0, 2)
+        file_size = f.tell()
+        if btb_end + 4 > file_size:
+            raise ValueError(f"{path}: too small for claimed FT/BT sections")
         f.seek(btb_end)
+        magic_peek = f.read(4)
+        if magic_peek != b"glTF":
+            _, _, _, _, btb_end = _b3dm_section_starts(
+                ftj, ftb, btj, btb, padded=False,
+            )
+            if btb_end + 4 > file_size:
+                raise ValueError(f"{path}: too small for raw-layout sections")
+            f.seek(btb_end)
+            magic_peek = f.read(4)
+            if magic_peek != b"glTF":
+                raise ValueError(f"{path}: expected GLB magic")
         # GLB container: 4-byte magic + 4-byte version + 4-byte length
         # followed by chunks, each: 4-byte length + 4-byte type + data
-        if f.read(4) != b"glTF":
-            raise ValueError(f"{path}: expected GLB magic")
         f.read(4)  # GLB version (uint32)
         f.read(4)  # GLB total length (uint32)
         json_chunk_len = struct.unpack("<I", f.read(4))[0]
@@ -163,7 +230,23 @@ b3dm_position_count = _b3dm_position_count
 
 
 def parse_b3dm(path: Path) -> B3dm:
-    """Parse a .b3dm file: 28-byte header, feature/batch tables, embedded GLB."""
+    """Parse a .b3dm file: 28-byte header, feature/batch tables, embedded GLB.
+
+    Robust against two layout variants:
+
+    * **Spec-conformant**: each section is padded to an 8-byte boundary
+      (the 3D Tiles 1.0 norm; what Cesium-ion and most generators emit).
+    * **No-padding**: sections run back-to-back at their raw byte lengths
+      (some non-spec generators do this — e.g. the tileset behind task
+      ``20260811153934A331BD`` writes ``{"BATCH_LENGTH":2}`` immediately
+      followed by ``{"batchId":[...]}`` with no NUL gap).
+
+    We probe the spec-conformant layout first; if ``"glTF"`` magic isn't
+    at the predicted offset, we retry with raw lengths. Either way, the
+    FT/BT JSON is sliced at its raw ``ftj`` / ``btj`` length — alignment
+    padding (when present) sits OUTSIDE the JSON value and would trigger
+    ``JSONDecodeError: Extra data`` if included.
+    """
     data = path.read_bytes()
     if data[:4] != b"b3dm":
         raise ValueError(f"{path}: not a b3dm file (magic={data[:4]!r})")
@@ -171,25 +254,41 @@ def parse_b3dm(path: Path) -> B3dm:
         warnings.warn(f"{path}: b3dm version != 1")
 
     ftj, ftb, btj, btb = struct.unpack_from("<IIII", data, 12)
-    cursor = 28
-    ftj_end = cursor + _align8(ftj)
-    ftb_end = ftj_end + _align8(ftb)
-    btj_end = ftb_end + _align8(btj)
-    btb_end = btj_end + _align8(btb)
 
-    ft = json.loads(data[cursor:ftj_end]) if ftj else {}
-    bt = json.loads(data[ftb_end:btj_end]) if btj else {}
+    # Probe the spec-conformant (8-byte aligned) layout first. If the
+    # GLB magic isn't at the predicted offset, fall back to raw lengths.
+    _, _, _, _, glb_off = _b3dm_section_starts(
+        ftj, ftb, btj, btb, padded=True,
+    )
+    padded = data[glb_off:glb_off + 4] == b"glTF"
+    if not padded:
+        _, _, _, _, glb_off = _b3dm_section_starts(
+            ftj, ftb, btj, btb, padded=False,
+        )
+        if data[glb_off:glb_off + 4] != b"glTF":
+            raise ValueError(
+                f"{path}: GLB magic not found at offset {glb_off} "
+                f"(tried spec-aligned AND no-padding layouts; ftj={ftj}, "
+                f"ftb={ftb}, btj={btj}, btb={btb})"
+            )
 
-    glb_off = btb_end
-    if data[glb_off:glb_off + 4] != b"glTF":
-        raise ValueError(f"{path}: expected GLB magic at offset {glb_off}")
+    ftj_start, ftb_start, btj_start, _, glb_off = _b3dm_section_starts(
+        ftj, ftb, btj, btb, padded=padded,
+    )
+
+    # FT/BT JSON is sliced at its RAW byte length — alignment padding
+    # (when present) is OUTSIDE the JSON value and would trigger
+    # ``JSONDecodeError: Extra data``. The JSON itself is exactly
+    # ``ftj`` / ``btj`` bytes long.
+    ft = json.loads(data[ftj_start:ftj_start + ftj]) if ftj else {}
+    bt = json.loads(data[btj_start:btj_start + btj]) if btj else {}
 
     json_chunk_len = struct.unpack_from("<I", data, glb_off + 12)[0]
     if data[glb_off + 16:glb_off + 20] != b"JSON":
         raise ValueError(f"{path}: first GLB chunk is not JSON")
     gltf = json.loads(data[glb_off + 20:glb_off + 20 + json_chunk_len])
 
-    bin_off = glb_off + 20 + _align8(json_chunk_len)
+    bin_off = glb_off + 20 + _align4(json_chunk_len)
     bin_chunk_len = struct.unpack_from("<I", data, bin_off)[0]
     if data[bin_off + 4:bin_off + 8] != b"BIN\x00":
         raise ValueError(f"{path}: second GLB chunk is not BIN")
@@ -199,8 +298,37 @@ def parse_b3dm(path: Path) -> B3dm:
 
 
 def read_accessor(gltf: dict, bin_payload: bytes, idx: int) -> np.ndarray:
-    """Materialise accessor `idx` as a writable (count, n_components) array."""
+    """Materialise accessor `idx` as a writable (count, n_components) array.
+
+    Raises ``UnsupportedExtensionError`` if the gltf declares
+    ``KHR_draco_mesh_compression`` (which the codebase does not yet
+    decode) or any other extension that would replace the standard
+    ``accessor.bufferView → bufferView.byteOffset → BIN chunk`` lookup
+    chain. The cryptic ``KeyError: 'bufferView'`` that would otherwise
+    leak out is replaced with a clear actionable message — the
+    operator can then either regenerate the tileset without Draco or
+    implement KHR_draco_mesh_compression support.
+    """
     acc = gltf["accessors"][idx]
+    ext_used = set(gltf.get("extensionsUsed") or [])
+    if "KHR_draco_mesh_compression" in ext_used:
+        raise UnsupportedExtensionError(
+            "gltf declares KHR_draco_mesh_compression, but the codebase "
+            "has no Draco decoder installed. POSITION accessor is "
+            "compressed inside a Draco blob, not stored as raw floats "
+            "in the BIN chunk. Options: (a) regenerate the tileset "
+            "without Draco, (b) install `draco` Python package and "
+            "implement decode in this function."
+        )
+    if "bufferView" not in acc:
+        # Anything else that drops bufferView is also unsupported here.
+        raise UnsupportedExtensionError(
+            f"accessor[{idx}] is missing 'bufferView' (type={acc.get('type')}, "
+            f"componentType={acc.get('componentType')}). The gltf "
+            f"declares extensionsUsed={sorted(ext_used) or '[]'}; if "
+            f"a bufferView-providing extension is in use, this codebase "
+            f"doesn't decode it."
+        )
     bv = gltf["bufferViews"][acc["bufferView"]]
     itemsize, dtype = _COMPONENT_INFO[acc["componentType"]]
     n_comp = _NUM_COMPONENTS[acc["type"]]

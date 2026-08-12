@@ -18,8 +18,8 @@
 <body>
   <div id="cesiumContainer"></div>
   <div id="toolbar">
-    <label><input type="checkbox" id="chkMeshTiles" checked> 3D Tiles · 城市网格 (wuxi_260205)</label>
-    <label><input type="checkbox" id="chkMeshTilesB" checked> 3D Tiles · 城市网格 (wuxi_251022)</label>
+    <label><input type="checkbox" id="chkMeshTiles" checked> 3D Tiles · 城市网格 (对比模型)</label>
+    <label><input type="checkbox" id="chkMeshTilesB" checked> 3D Tiles · 城市网格 (参考模型)</label>
     <label><input type="checkbox" id="chkPointTiles" checked> 3D Tiles · 点云</label>
     <label><input type="checkbox" id="chkBbox"> 聚类 · 包围盒 (AABB)</label>
     <label><input type="checkbox" id="chkHull" checked> 聚类 · 凸包 (紧贴)</label>
@@ -57,10 +57,10 @@
 
     // —— 1. 加载城市网格 3D Tiles ——
     async function loadMeshTiles() {
-      setStatus('正在加载城市网格 3D Tiles…');
+      setStatus('正在加载 对比 3D Tiles…');
       try {
         const ts = await Cesium.Cesium3DTileset.fromUrl(
-          '../../dataset/taicang_2605/tileset.json'
+          '../../../../model/Dvv3BdNmlPnUPp37dbWiOTpiCnZil5EwHGFDYiHaWd0YWzg8vH3eS9LexTET0iXU/tileset.json'
         );
         viewer.scene.primitives.add(ts);
         await ts.readyPromise;
@@ -79,7 +79,7 @@
       setStatus('正在加载点云 3D Tiles…');
       try {
         const ts = await Cesium.Cesium3DTileset.fromUrl(
-          '../../dataset_output/test/taicang/3DTiles/tileset.json'
+          '../../output/20260811170311EF8936/3DTiles/tileset.json'
         );
         viewer.scene.primitives.add(ts);
         await ts.readyPromise;
@@ -162,7 +162,7 @@
     async function loadClusters() {
       setStatus('正在加载聚类结果…');
       try {
-        const resp = await fetch('../../dataset_output/test/taicang/instances.json');
+        const resp = await fetch('../../output/20260811170311EF8936/instances.json');
         const data = await resp.json();
         const n = data.n_clusters;
         console.log(`[Cluster] eps=${data.eps}, min_points=${data.min_points}, n_clusters=${n}, n_input=${data.n_input_points}`);
@@ -244,10 +244,10 @@
 
     // —— 3.5. 加载第二个城市网格 3D Tiles(wuxi_251022,作为对比)——
     async function loadMeshTilesB() {
-      setStatus('正在加载 wuxi_251022 3D Tiles…');
+      setStatus('正在加载 参考 3D Tiles…');
       try {
         const ts = await Cesium.Cesium3DTileset.fromUrl(
-          '../../dataset/taicang_2511/tileset.json'
+          '../../../../model/Dvv3BdNmlPnUPp37dbWiOZhYXbJXIN0bIJjv28YpAQGSa4L3XSmd466AJgGIHZyL/tileset.json'
         );
         viewer.scene.primitives.add(ts);
         await ts.readyPromise;
