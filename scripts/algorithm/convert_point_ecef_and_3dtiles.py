@@ -62,6 +62,7 @@ python convert_enu_ecef.py \
 """
 from __future__ import annotations
 import json
+import math
 import sys
 import argparse
 from pathlib import Path
@@ -80,6 +81,10 @@ from algo_config import (      # noqa: E402
     DBSCAN_VOXEL_M,
     HULL_PARALLEL_MIN_N,
     LAS_SCALE_M,
+    HAG_MAX_LOW_M,
+    HAG_MIN_HIGH_M,
+    CONFIDENCE_PEAK_N,
+    CONFIDENCE_SIGMA_N,
 )
 
 # Supported scalar PLY property types. list properties are skipped.
@@ -352,6 +357,11 @@ def cluster_instances(
     eps: float = DBSCAN_EPS_M,
     min_points: int = DBSCAN_MIN_POINTS,
     voxel_m: float = DBSCAN_VOXEL_M,
+    height_above_ground: np.ndarray | None = None,
+    hag_max_low_m: float = HAG_MAX_LOW_M,
+    hag_min_high_m: float = HAG_MIN_HIGH_M,
+    confidence_peak_n: int = CONFIDENCE_PEAK_N,
+    confidence_sigma_n: float = CONFIDENCE_SIGMA_N,
 ) -> tuple[list[dict], np.ndarray]:
     """DBSCAN-cluster the ENU point cloud and emit one AABB per cluster in ECEF.
 
@@ -375,9 +385,36 @@ def cluster_instances(
       non-coplanar points), in which case the consumer should fall back
       to ``bbox_*`` rendering.
 
-    Cluster IDs are 1-based and skip noise (DBSCAN label = -1). Returned
-    list is sorted by ``num_points`` descending, ties broken by the
-    original DBSCAN label ascending (= stable, deterministic re-rank).
+    When ``height_above_ground`` is supplied, the **两违 (illegal-occupation /
+    illegal-construction) post-filter** is applied:
+
+    - Per-cluster ``hag_min`` / ``hag_max`` / ``hag_mean`` (height above
+      a scalar ground reference: bottom-percentile mean of B's z, in
+      metres) are computed from the per-point array passed in.
+    - A cluster is kept iff **all** its points are ``<= hag_max_low_m``
+      (ground occupation / ground-floor 违建) **or all** are
+      ``>= hag_min_high_m`` (rooftop 违建 like sunrooms). Clusters
+      spanning the (5, 20) m band, or containing any non-finite value,
+      are rejected (fail-closed).
+    - Each kept cluster receives a Gaussian-shaped
+      ``confidence_score = exp(-0.5 * ((num_points - peak) / sigma)^2)``.
+      The output ``id`` field is the **ranking position** (1..N by
+      ``confidence_score`` desc, ties broken by ``num_points`` desc, then
+      original DBSCAN label asc). The original 0-based DBSCAN label is
+      preserved on ``dbscan_label`` for diagnostics.
+    - Rejected clusters are removed from the returned ``clusters`` list
+      **and** their per-point labels are remapped to ``-1`` so the
+      caller's ``labels >= 0`` mask treats them as noise.
+
+    When ``height_above_ground`` is ``None`` the legacy behaviour is
+    preserved verbatim: all clusters kept, ranked by ``num_points``
+    desc with id ties broken by DBSCAN label asc.
+
+    The orchestrator selects between the two paths via the
+    ``ALGO_VIOLATION_MODE`` env var (``on`` = filter+rank, default;
+    ``off`` = legacy num_points sort).
+
+    Cluster IDs are 1-based and skip noise (DBSCAN label = -1).
 
     **Memory note (2026-07):** open3d's C++ ``cluster_dbscan``
     materialises the entire ε-neighbour graph (~4 B/pt + 4 B/edge)
@@ -397,15 +434,42 @@ def cluster_instances(
     Returns
     -------
     clusters : list[dict]
-        Per-cluster metadata (see fields above). Excludes noise points.
+        Per-cluster metadata (see fields above). Excludes noise points
+        and (when ``height_above_ground`` is supplied) any cluster
+        rejected by the height filter.
     labels : np.ndarray of int64, shape (N,)
         Per-point DBSCAN label, same length as ``xyz_enu`` / ``ecef``.
         ``-1`` means noise; non-negative values are 0-based cluster ids
-        matching the entries in ``clusters``. Use ``labels >= 0`` as a
-        boolean mask to filter noise out of the original point cloud
-        (e.g. to make clustering double as a filter on the output).
+        matching the entries in ``clusters`` (or, when the violation
+        filter rejects a cluster, all its points are mapped to ``-1``
+        as well so the caller's ``labels >= 0`` mask is correct).
     """
     import open3d as o3d  # local import to keep top-level import set stable
+
+    # ---- Input validation (height_above_ground) ----
+    if height_above_ground is not None:
+        if height_above_ground.ndim != 1:
+            raise ValueError(
+                f"height_above_ground must be 1-D, got ndim={height_above_ground.ndim}"
+            )
+        if height_above_ground.shape[0] != xyz_enu.shape[0]:
+            raise ValueError(
+                f"height_above_ground length {height_above_ground.shape[0]} "
+                f"!= xyz_enu length {xyz_enu.shape[0]}"
+            )
+        if confidence_sigma_n <= 0:
+            raise ValueError(
+                f"confidence_sigma_n must be > 0, got {confidence_sigma_n}"
+            )
+        n_bad = int(np.sum(~np.isfinite(height_above_ground)))
+        if n_bad:
+            print(
+                f"[violation-filter] WARNING: {n_bad:,}/"
+                f"{len(height_above_ground):,} height values are "
+                f"non-finite (NaN/inf); those points will cause the "
+                f"host cluster to be rejected.",
+                file=sys.stderr,
+            )
 
     n_orig = len(xyz_enu)
 
@@ -475,6 +539,60 @@ def cluster_instances(
     unique_labels = sorted(int(x) for x in np.unique(labels) if x >= 0)
     n_clusters = len(unique_labels)
 
+    # ---- Phase 1: height statistics + scenario + confidence ----
+    # (only when the violation filter is enabled). We compute these
+    # BEFORE the hull so that we can skip hull work for clusters that
+    # are guaranteed to be rejected. cluster_records are later filtered
+    # to the "kept" subset, then hull-only is run on those.
+    cluster_records: list[dict] | None = None
+    rejected_cids: set[int] = set()
+    if height_above_ground is not None and n_clusters > 0:
+        cluster_records = []
+        for cid_0based in unique_labels:
+            mask = labels == cid_0based
+            h = height_above_ground[mask]
+            hag_min = float(h.min())
+            hag_max = float(h.max())
+            hag_mean = float(h.mean())
+            n_pts = int(mask.sum())
+            if not (np.isfinite(hag_min) and np.isfinite(hag_max)
+                    and np.isfinite(hag_mean)):
+                scenario = "mid"
+            elif hag_max <= hag_max_low_m:
+                scenario = "ground"
+            elif hag_min >= hag_min_high_m:
+                scenario = "rooftop"
+            else:
+                scenario = "mid"
+            passed = scenario in ("ground", "rooftop")
+            delta = (n_pts - confidence_peak_n) / confidence_sigma_n
+            confidence_score = float(math.exp(-0.5 * delta * delta))
+            cluster_records.append({
+                "cid_0based": cid_0based,
+                "mask": mask,
+                "hag_min": hag_min,
+                "hag_max": hag_max,
+                "hag_mean": hag_mean,
+                "scenario": scenario,
+                "passed_height_filter": passed,
+                "num_points": n_pts,
+                "confidence_score": confidence_score,
+            })
+        n_before = len(cluster_records)
+        kept_records = [r for r in cluster_records if r["passed_height_filter"]]
+        n_rejected_mid = n_before - len(kept_records)
+        rejected_cids = {
+            r["cid_0based"] for r in cluster_records if not r["passed_height_filter"]
+        }
+        print(
+            f"[violation-filter] kept {len(kept_records)}/{n_before} clusters "
+            f"(rejected {n_rejected_mid} mid-range; thresholds: "
+            f"<= {hag_max_low_m} m or >= {hag_min_high_m} m)",
+            file=sys.stderr,
+        )
+    else:
+        kept_records = None
+
     # ---- Per-cluster bbox + convex hull (serial path) ----
     # The previous version ran this in a ThreadPoolExecutor (one worker
     # per cluster, bounded by CPU count). QuickHull inside open3d
@@ -497,25 +615,83 @@ def cluster_instances(
         # a parallel path that *doesn't* materialise masked copies.
         pass  # serial path below
     clusters: list[dict] = []
-    for cid_0based in unique_labels:
-        # Build a single shared mask once, then slice the two
-        # attribute arrays in place — single mask allocation, no
-        # extra intermediate. The mask is the dominant per-cluster
-        # allocation but it's one N-byte array per cluster rather
-        # than N-byte * workers in flight.
-        mask = labels == cid_0based
-        _, info = _hull_one_cluster(cid_0based, ecef[mask], xyz_enu[mask])
-        clusters.append(info)
-        del mask
-    # Re-rank so `id=1` is the cluster with the most points. Ties break
-    # by the original DBSCAN label ascending (= current `id` field
-    # before this re-rank) so output is stable and deterministic across
-    # runs on the same input. Done in place; downstream
-    # `write_instances_json` serializes the renumbered list verbatim.
-    clusters.sort(key=lambda c: (-c["num_points"], c["id"]))
+    if kept_records is not None:
+        # Violation-filter path: hull only for the kept subset.
+        for r in kept_records:
+            mask = r["mask"]
+            _, info = _hull_one_cluster(r["cid_0based"], ecef[mask], xyz_enu[mask])
+            info["dbscan_label"] = r["cid_0based"]
+            info["num_points"] = r["num_points"]
+            info["hag_min"] = r["hag_min"]
+            info["hag_max"] = r["hag_max"]
+            info["hag_mean"] = r["hag_mean"]
+            info["scenario"] = r["scenario"]
+            info["confidence_score"] = r["confidence_score"]
+            info["passed_height_filter"] = True   # by construction
+            clusters.append(info)
+            del mask
+    else:
+        # Legacy path: hull for every DBSCAN cluster.
+        for cid_0based in unique_labels:
+            # Build a single shared mask once, then slice the two
+            # attribute arrays in place — single mask allocation, no
+            # extra intermediate. The mask is the dominant per-cluster
+            # allocation but it's one N-byte array per cluster rather
+            # than N-byte * workers in flight.
+            mask = labels == cid_0based
+            _, info = _hull_one_cluster(cid_0based, ecef[mask], xyz_enu[mask])
+            clusters.append(info)
+            del mask
+
+    # ---- Re-rank ----
+    # Violation-filter path: confidence_score desc, ties broken by
+    # num_points desc, then current id asc (stable). Legacy path keeps
+    # the original (-num_points, id) sort. The renumber below gives the
+    # surviving clusters contiguous 1..N ids.
+    if kept_records is not None:
+        clusters.sort(key=lambda c: (
+            -c["confidence_score"],
+            -c["num_points"],
+            c["id"],
+        ))
+    else:
+        clusters.sort(key=lambda c: (-c["num_points"], c["id"]))
     for new_id, c in enumerate(clusters, start=1):
         c["id"] = new_id
-    return clusters, labels
+
+    # ---- Remap rejected labels to -1 (noise) ----
+    # Keeps the contract that ``labels >= 0`` ⇔ point is in a kept
+    # cluster, regardless of which path the caller took. Caller
+    # already uses ``labels >= 0`` as a noise mask
+    # (stage_convert in run_pipeline.py:728-741).
+    if rejected_cids:
+        labels = labels.copy()
+        for cid in rejected_cids:
+            labels[labels == cid] = -1
+        print(
+            f"[violation-filter] remapped {len(rejected_cids)} rejected "
+            f"cluster labels to -1 (noise)",
+            file=sys.stderr,
+        )
+
+    # Free the per-cluster masks in cluster_records (some of which are
+    # still referenced by the kept set above — those stay live via the
+    # clusters dict; the rejected ones are GC'd here).
+    if cluster_records is not None:
+        for r in cluster_records:
+            if not r["passed_height_filter"]:
+                r.pop("mask", None)
+
+    # Pre-filter cluster count — only meaningful when the violation
+    # filter ran; under the legacy (height_above_ground=None) path
+    # this equals ``len(clusters)`` and the caller can still populate
+    # ``n_clusters_before_height_filter`` with it.
+    if height_above_ground is not None:
+        n_before_filter = len(cluster_records)
+    else:
+        n_before_filter = len(clusters)
+
+    return clusters, labels, n_before_filter
 
 
 def _hull_one_cluster(
@@ -572,13 +748,47 @@ def write_instances_json(
     eps: float,
     min_points: int,
     n_input_points: int,
+    height_filter_enabled: bool = False,
+    hag_max_low_m: float | None = None,
+    hag_min_high_m: float | None = None,
+    confidence_peak_n: int | None = None,
+    confidence_sigma_n: float | None = None,
+    n_clusters_before_height_filter: int | None = None,
+    dtm_ground_count: int | None = None,
 ) -> None:
-    """Emit the Cesium-facing instances.json next to the 3D Tiles."""
+    """Emit the Cesium-facing instances.json next to the 3D Tiles.
+
+    Top-level metadata fields surface the filter configuration and the
+    ground-reference quality diagnostic so downstream consumers
+    (visualization, OSS archival) can self-describe the artifact.
+
+    ``dtm_ground_count`` semantics: count of B points that contributed
+    to the scalar ground estimate (≈ GROUND_PERCENTILE% × N_pts_b).
+    The threshold ladder (<200 / 200–999 / ≥1000 → poor/ok/good) is
+    retained unchanged from the prior CSF-based path so consumers can
+    interpret the field with the same rule.
+    """
+    if dtm_ground_count is None:
+        dtm_quality = "unavailable"
+    elif dtm_ground_count >= 1000:
+        dtm_quality = "good"
+    elif dtm_ground_count >= 200:
+        dtm_quality = "ok"
+    else:
+        dtm_quality = "poor"
     payload = {
         "eps": eps,
         "min_points": min_points,
         "n_input_points": n_input_points,
         "n_clusters": len(clusters),
+        "n_clusters_before_height_filter": n_clusters_before_height_filter,
+        "height_filter_enabled": height_filter_enabled,
+        "hag_max_low_m": hag_max_low_m,
+        "hag_min_high_m": hag_min_high_m,
+        "confidence_peak_n": confidence_peak_n,
+        "confidence_sigma_n": confidence_sigma_n,
+        "dtm_ground_count": dtm_ground_count,
+        "dtm_quality": dtm_quality,
         "clusters": clusters,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -718,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
     # 注意:instances.json 必须在 py3dtiles(--overwrite 会清空输出目录)之后写,
     # 因此这里只保留 clusters 数据,JSON 落盘放到最后一步。
     if args.cluster:
-        clusters, labels = cluster_instances(
+        clusters, labels, n_clusters_before_filter = cluster_instances(
             xyz_enu=xyz,
             ecef=ecef,
             eps=args.eps,
@@ -778,12 +988,16 @@ def main(argv: list[str] | None = None) -> int:
     #    tiles_out 之外 / 之内都不会被 py3dtiles 触及——我们写到 args.tiles_out
     #    之外即 <out>/instances.json,py3dtiles 写的是 <out>/3DTiles/...)
     if args.cluster:
+        # Standalone PLY path doesn't run the violation filter, so
+        # pre-filter == post-filter == n_clusters. Pass it through
+        # so the JSON consumer sees the same schema shape either way.
         write_instances_json(
             instances_path,
             clusters,
             eps=args.eps,
             min_points=args.min_points,
             n_input_points=len(xyz),
+            n_clusters_before_height_filter=n_clusters_before_filter,
         )
         print(f"[cluster] instances.json written -> {instances_path}", file=sys.stderr)
         # Drop the cluster-list reference so the per-cluster hull dicts

@@ -49,9 +49,7 @@ from point_cloud_extraction import (  # noqa: E402
     load_root_transform,
 )
 from filter_vegetation import (  # noqa: E402
-    classify_ground_csf,
     compute_exg,
-    compute_height_above_dtm,
 )
 from convert_point_ecef_and_3dtiles import (  # noqa: E402
     _estimate_peak_gib,
@@ -69,16 +67,17 @@ from roi import (  # noqa: E402
     polygon_to_b_enu,
 )
 from algo_config import (                            # noqa: E402
-    CSF_CLASS_THRESHOLD,
-    CSF_CLOTH_RESOLUTION,
-    CSF_ITERATIONS,
-    CSF_SUBSAMPLE_RES,
+    CONFIDENCE_PEAK_N,
+    CONFIDENCE_SIGMA_N,
     DBSCAN_EPS_M,
     DBSCAN_MIN_POINTS,
     DBSCAN_VOXEL_M,
-    DTM_GRID_RES,
     EXG_THRESHOLD,
     EXTRACT_MAX_WORKERS,
+    GROUND_PERCENTILE,
+    HAG_MAX_LOW_M,
+    HAG_MIN_HIGH_M,
+    VIOLATION_MODE,
     MAX_VEG_HEIGHT_M,
     MIN_VEG_HEIGHT_M,
     NN_LEAFSIZE,
@@ -97,11 +96,7 @@ from scipy.spatial import cKDTree
 # through to algo_config at access time.
 # =============================================================================
 class _CONFIG:
-    CSF_CLOTH_RESOLUTION = CSF_CLOTH_RESOLUTION
-    CSF_CLASS_THRESHOLD  = CSF_CLASS_THRESHOLD
-    CSF_ITERATIONS       = CSF_ITERATIONS
-    CSF_SUBSAMPLE_RES    = CSF_SUBSAMPLE_RES
-    DTM_GRID_RES         = DTM_GRID_RES
+    GROUND_PERCENTILE    = GROUND_PERCENTILE
     MIN_VEG_HEIGHT_M     = MIN_VEG_HEIGHT_M
     MAX_VEG_HEIGHT_M     = MAX_VEG_HEIGHT_M
     EXG_THRESHOLD        = EXG_THRESHOLD
@@ -109,6 +104,11 @@ class _CONFIG:
     DBSCAN_EPS_M         = DBSCAN_EPS_M
     DBSCAN_MIN_POINTS    = DBSCAN_MIN_POINTS
     DBSCAN_VOXEL_M       = DBSCAN_VOXEL_M
+    HAG_MAX_LOW_M        = HAG_MAX_LOW_M
+    HAG_MIN_HIGH_M       = HAG_MIN_HIGH_M
+    VIOLATION_MODE       = VIOLATION_MODE
+    CONFIDENCE_PEAK_N    = CONFIDENCE_PEAK_N
+    CONFIDENCE_SIGMA_N   = CONFIDENCE_SIGMA_N
 
 
 # -----------------------------------------------------------------------------
@@ -151,6 +151,21 @@ class _Bag:
     rgb_filt:       Optional[np.ndarray] = None  # Stage 2 → Stage 3
     pts_diff:       Optional[np.ndarray] = None  # Stage 3 → Stage 4
     rgb_diff:       Optional[np.ndarray] = None  # Stage 3 → Stage 4
+    # height_above_ground_filt / _diff: per-point height above a scalar
+    # ground reference (metres, f64). Stage 2 takes the mean z of the
+    # bottom-GROUND_PERCENTILE% of pts_b[:, 2] (no CSF / DTM) and
+    # subtracts that scalar from every B point, then slices by the
+    # vegetation mask. Stage 3 re-slices by the NN-distance mask.
+    # Stage 4 feeds the result to cluster_instances so the 两违 post-filter
+    # can apply the height-bucket rule.
+    height_above_ground_filt: Optional[np.ndarray] = None  # Stage 2 → Stage 3
+    height_above_ground_diff: Optional[np.ndarray] = None  # Stage 3 → Stage 4
+    # dtm_ground_count: count of B points that contributed to the scalar
+    # ground estimate (≈ GROUND_PERCENTILE% × N_pts_b). Low values (<200)
+    # flag a possibly-unreliable ground reference (the bottom of B's z
+    # distribution might be a flat roof) — surfaced in instances.json as
+    # dtm_quality="poor". None ⇒ unknown / legacy path.
+    dtm_ground_count: Optional[int] = None                 # Stage 2 → Stage 4
     transform_b:    Optional[list]        = None  # Stage 1 → Stage 4
 
     def reset(self) -> None:
@@ -467,11 +482,12 @@ def stage_extract(tileset_a: Path, tileset_b: Path, inter_dir: Path | None,
 
     # ----- ROI mask (Stage 1 exit) -----
     # Both A and B are masked to the polygon in B's local ENU so the
-    # entire downstream pipeline (CSF vegetation filter → NN → DBSCAN)
-    # only sees ROI points. This prevents the "stolen nearest neighbour"
-    # effect (a B point near the ROI boundary finding a closer A point
-    # outside the ROI and being mis-classified as "no change"), and
-    # makes `instances.json` / `3DTiles` naturally ROI-only.
+    # entire downstream pipeline (ExG vegetation filter → scalar ground
+    # estimate → NN → DBSCAN) only sees ROI points. This prevents the
+    # "stolen nearest neighbour" effect (a B point near the ROI boundary
+    # finding a closer A point outside the ROI and being mis-classified
+    # as "no change"), and makes `instances.json` / `3DTiles` naturally
+    # ROI-only.
     if roi is not None and roi.active:
         keep_b = points_in_polygon(points_b[:, 0], points_b[:, 1],
                                    roi.polygon_enu)
@@ -505,7 +521,7 @@ def stage_extract(tileset_a: Path, tileset_b: Path, inter_dir: Path | None,
 
 
 # =============================================================================
-# Stage 2: vegetation filter on B (CSF + height-above-DTM + ExG)
+# Stage 2: vegetation filter on B (ExG) + scalar ground estimate
 # =============================================================================
 def stage_filter_vegetation(*, bag: _Bag, inter_dir: Path | None) -> None:
     pts_b  = bag.pts_b
@@ -519,44 +535,18 @@ def stage_filter_vegetation(*, bag: _Bag, inter_dir: Path | None) -> None:
     g16 = (rgb_b[:, 1].astype(np.uint32) * 257).astype(np.uint16)
     b16 = (rgb_b[:, 2].astype(np.uint32) * 257).astype(np.uint16)
 
-    # CSF subsampling: cloth simulation is invariant to point density
-    # at fixed cloth_resolution, so feeding CSF a 1m voxel-grid
-    # subsample (1 representative point per cubic metre) gives the
-    # same ground seeds as the full cloud, in 1/30-1/45 of the time on
-    # typical urban densities. The DTM is then interpolated from the
-    # subset's ground points and re-evaluated at every original B
-    # point via 2D nearest-neighbour (DTM grid is 2 m, so within a
-    # 1 m voxel the DTM height is essentially uniform).
-    sub_res = _CONFIG.CSF_SUBSAMPLE_RES
-    if sub_res > 0:
-        voxel_idx = np.floor(pts_b / sub_res).astype(np.int64)
-        _, first_idx = np.unique(voxel_idx, axis=0, return_index=True)
-        sub_pts = pts_b[np.sort(first_idx)]
-    else:
-        sub_pts = pts_b
-    n_sub = len(sub_pts)
-    print(f"  CSF input: {n_sub:,} pts (subsample {n_sub / len(pts_b) * 100:.1f}% "
-          f"of {len(pts_b):,})", flush=True)
-
-    ground_mask = classify_ground_csf(
-        sub_pts[:, 0], sub_pts[:, 1], sub_pts[:, 2],
-        cloth_resolution=_CONFIG.CSF_CLOTH_RESOLUTION,
-        class_threshold=_CONFIG.CSF_CLASS_THRESHOLD,
-        iterations=_CONFIG.CSF_ITERATIONS,
-        bSloopSmooth=False,
-        rigidness=2,
-        time_step=0.65,
-        verbose=False,
-    )
-    sub_h_above = compute_height_above_dtm(
-        sub_pts[:, 0], sub_pts[:, 1], sub_pts[:, 2], ground_mask,
-        grid_res=_CONFIG.DTM_GRID_RES,
-    )
-    # Map subset h_above back to every original B point (2D nearest-neighbour)
-    tree = cKDTree(sub_pts[:, :2])
-    _, nearest = tree.query(pts_b[:, :2], k=1, workers=-1)
-    h_above = sub_h_above[nearest]
-    del tree, nearest
+    # 标量地面估计:取 pts_b z 值底部 GROUND_PERCENTILE%(默认 20%)的均值
+    # 当作地面参考 —— 一个标量,直接减去得到每个点的离地高度。
+    # 不依赖 CSF / DTM,城市建成区(地面点稀少)下比 CSF 拟合更稳健。
+    # 用途:Stage 4 的两违后置过滤(`h_above` 判定场景)。
+    z_thr = np.percentile(pts_b[:, 2], _CONFIG.GROUND_PERCENTILE)
+    ground_z = float(pts_b[:, 2][pts_b[:, 2] <= z_thr].mean())
+    h_above = pts_b[:, 2] - ground_z    # shape (N_pts_b,), 与植被 mask 同维
+    n_ground = int((pts_b[:, 2] <= z_thr).sum())
+    print(f"  ground_z = {ground_z:.3f} m "
+          f"(bottom {_CONFIG.GROUND_PERCENTILE}% of pts_b[:, 2], "
+          f"{n_ground:,} pts)",
+          flush=True)
 
     exg = compute_exg(r16, g16, b16)
     del r16, g16, b16  # uint16 colour scratch; not needed after ExG
@@ -576,15 +566,22 @@ def stage_filter_vegetation(*, bag: _Bag, inter_dir: Path | None) -> None:
 
     pts_filt = pts_b[keep].astype(np.float32, copy=False)
     rgb_filt = rgb_b[keep]
+    # Slice height-above-ground by the same vegetation mask. Stage 4 needs
+    # it (after Stage 3 re-slices by the NN-distance mask) to run the 两违
+    # height-bucket filter on each cluster.
+    hag_filt = h_above[keep]
+    del h_above  # ~80 MiB at B scale; drop now to avoid residency
     _maybe_dump_xyzrgb(inter_dir, "02_pts_b_no_veg", pts_filt, rgb_filt)
 
     # Publish outputs and drop the upstream B arrays — they're ~627 MiB
     # (pts_b) + 156 MiB (rgb_b) at typical B scale, and Stage 3 only
     # needs the filtered subset.
-    bag.pts_filt  = pts_filt
-    bag.rgb_filt  = rgb_filt
-    bag.pts_b     = None
-    bag.colors_b  = None
+    bag.pts_filt                = pts_filt
+    bag.rgb_filt                = rgb_filt
+    bag.height_above_ground_filt = hag_filt
+    bag.dtm_ground_count        = n_ground
+    bag.pts_b                   = None
+    bag.colors_b                = None
 
 
 # =============================================================================
@@ -594,8 +591,19 @@ def stage_nn(*, bag: _Bag, inter_dir: Path | None) -> None:
     pts_a     = bag.pts_a_aligned
     pts_b_filt = bag.pts_filt
     rgb_b_filt = bag.rgb_filt
+    hag_filt  = bag.height_above_ground_filt
     if pts_a is None or pts_b_filt is None or rgb_b_filt is None:
         raise RuntimeError("stage_nn: bag.pts_a_aligned / pts_filt / rgb_filt are None")
+    if hag_filt is None:
+        raise RuntimeError(
+            "stage_nn: bag.height_above_ground_filt is None — Stage 2 must "
+            "publish it before Stage 3 runs."
+        )
+    if hag_filt.shape[0] != pts_b_filt.shape[0]:
+        raise RuntimeError(
+            f"stage_nn: hag_filt length {hag_filt.shape[0]} != "
+            f"pts_b_filt length {pts_b_filt.shape[0]} (Stage 2 contract broken)"
+        )
     # cKDTree accepts float32 — dropping the legacy ``astype(np.float64,
     # copy=False)`` promotion saves 1.4 GiB peak RSS at N_f ≈ 50 M
     # points (the B tileset, after the ROI mask and vegetation drop).
@@ -604,6 +612,8 @@ def stage_nn(*, bag: _Bag, inter_dir: Path | None) -> None:
     keep = dist >= _CONFIG.NN_MIN_DISTANCE_M
     pts_diff = pts_b_filt[keep]
     rgb_diff = rgb_b_filt[keep]
+    # Re-slice height-above-ground by the same NN-distance mask.
+    hag_diff = hag_filt[keep]
     n_in = len(pts_b_filt)
     n_out = int(keep.sum())
     median_kept = float(np.median(dist[keep])) if n_out else 0.0
@@ -615,14 +625,17 @@ def stage_nn(*, bag: _Bag, inter_dir: Path | None) -> None:
     _maybe_dump_xyzrgb(inter_dir, "03_pts_diff", pts_diff, rgb_diff)
 
     # Publish + drop the upstream A and filtered B arrays — they're
-    # ~114 MiB (A) + 600 MiB (pts_filt) + 150 MiB (rgb_filt) and Stage 4
-    # only needs pts_diff / rgb_diff / transform_b.
-    bag.pts_diff = pts_diff
-    bag.rgb_diff = rgb_diff
-    bag.pts_a_aligned = None
-    bag.colors_a      = None
-    bag.pts_filt      = None
-    bag.rgb_filt      = None
+    # ~114 MiB (A) + 600 MiB (pts_filt) + 150 MiB (rgb_filt) + ~80 MiB
+    # (hag_filt) and Stage 4 only needs pts_diff / rgb_diff /
+    # transform_b / hag_diff / dtm_ground_count.
+    bag.pts_diff                  = pts_diff
+    bag.rgb_diff                  = rgb_diff
+    bag.height_above_ground_diff  = hag_diff
+    bag.pts_a_aligned             = None
+    bag.colors_a                  = None
+    bag.pts_filt                  = None
+    bag.rgb_filt                  = None
+    bag.height_above_ground_filt  = None
 
 
 # =============================================================================
@@ -658,8 +671,27 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
     pts_diff     = bag.pts_diff
     rgb_diff     = bag.rgb_diff
     transform_b  = bag.transform_b
+    hag_diff     = bag.height_above_ground_diff
+    dtm_ground_count = bag.dtm_ground_count
     if pts_diff is None or transform_b is None:
         raise RuntimeError("stage_convert: bag.pts_diff / transform_b are None")
+    if hag_diff is not None and hag_diff.shape[0] != pts_diff.shape[0]:
+        raise RuntimeError(
+            f"stage_convert: hag_diff length {hag_diff.shape[0]} != "
+            f"pts_diff length {pts_diff.shape[0]} (Stage 3 contract broken)"
+        )
+
+    # Violation-filter master switch (ALGO_VIOLATION_MODE): when off,
+    # drop the height array and let cluster_instances fall back to the
+    # legacy "all clusters kept, sort by num_points desc" path. All
+    # downstream consumers (LAS, PLY, write_instances_json) already
+    # gate on `hag_diff is None`, so this single conditional is enough.
+    if not _CONFIG.VIOLATION_MODE:
+        print(f"  [violation-filter] mode=off — skipping HAG filter + "
+              f"confidence ranking; cluster_instances will sort by "
+              f"num_points desc (legacy path)",
+              flush=True)
+        hag_diff = None
 
     # ---- Pre-flight: refuse if predicted peak would OOM ----
     # Empirical model (see convert_point_ecef_and_3dtiles._estimate_peak_gib);
@@ -704,12 +736,25 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
     ecef = pts_diff @ T[:3, :3].T + T[:3, 3]
     # (preserve pts_diff for cluster_instances — ecef needs the same N)
 
-    # 2. DBSCAN cluster in ENU frame (now voxel-decimated internally)
-    clusters_pre, labels = cluster_instances(
+    # 2. DBSCAN cluster in ENU frame (now voxel-decimated internally).
+    #    When hag_diff is supplied, the two-violation post-filter runs
+    #    inside cluster_instances — height-bucket hard-filter +
+    #    Gaussian confidence_score ranking. The returned ``labels``
+    #    array already has any rejected-cluster ids remapped to -1
+    #    so the ``keep = labels >= 0`` line below is correct under
+    #    either path. ``cluster_instances`` now returns a 3-tuple so
+    #    ``n_clusters_before_filter`` carries the **pre-filter** count
+    #    (299 in the test run, vs 148 after filtering) into the JSON.
+    clusters_pre, labels, n_clusters_before_filter = cluster_instances(
         pts_diff, ecef,
         eps=_CONFIG.DBSCAN_EPS_M,
         min_points=_CONFIG.DBSCAN_MIN_POINTS,
         voxel_m=_CONFIG.DBSCAN_VOXEL_M,
+        height_above_ground=hag_diff,
+        hag_max_low_m=_CONFIG.HAG_MAX_LOW_M,
+        hag_min_high_m=_CONFIG.HAG_MIN_HIGH_M,
+        confidence_peak_n=_CONFIG.CONFIDENCE_PEAK_N,
+        confidence_sigma_n=_CONFIG.CONFIDENCE_SIGMA_N,
     )
 
     # 3. Drop DBSCAN noise (always required by this pipeline)
@@ -755,6 +800,15 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
         eps=_CONFIG.DBSCAN_EPS_M,
         min_points=_CONFIG.DBSCAN_MIN_POINTS,
         n_input_points=n_total,
+        height_filter_enabled=(hag_diff is not None),
+        hag_max_low_m=_CONFIG.HAG_MAX_LOW_M if hag_diff is not None else None,
+        hag_min_high_m=_CONFIG.HAG_MIN_HIGH_M if hag_diff is not None else None,
+        confidence_peak_n=_CONFIG.CONFIDENCE_PEAK_N if hag_diff is not None else None,
+        confidence_sigma_n=_CONFIG.CONFIDENCE_SIGMA_N if hag_diff is not None else None,
+        n_clusters_before_height_filter=(
+            n_clusters_before_filter if hag_diff is not None else None
+        ),
+        dtm_ground_count=dtm_ground_count,
     )
     # clusters_pre is a list of dicts holding bbox / hull data; release.
     del clusters_pre
@@ -765,9 +819,11 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
         tmp_las.unlink()
 
     # Drop the upstream scratch we no longer need.
-    bag.pts_diff    = None
-    bag.rgb_diff    = None
-    bag.transform_b = None
+    bag.pts_diff                  = None
+    bag.rgb_diff                  = None
+    bag.transform_b               = None
+    bag.height_above_ground_diff  = None
+    bag.dtm_ground_count          = None
 
     print(f"  3D Tiles: {tiles_dir}", flush=True)
     print(f"  instances.json: {out_dir / 'instances.json'}", flush=True)

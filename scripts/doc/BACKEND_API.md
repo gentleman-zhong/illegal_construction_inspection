@@ -574,6 +574,7 @@ const instances = await fetch(instanceUrl).then(r => r.json());
 | OSS 配置文件 | `scripts/service/oss_config.json`（覆盖用 `OSS_CONFIG` 环境变量） |
 | 后端回调 URL（保底） | `http://192.168.4.20:8088/api/two-illegal-compare/tasks/callback` |
 | 回调超时 / 重试 | `callback_timeout_seconds=10`、`callback_max_retries=3`（均在 `oss_config.json`） |
+| 算法后处理主开关 | `ALGO_VIOLATION_MODE=on`（默认） / `off`（见 §9.6） |
 
 ### 9.2 SSH 接入
 
@@ -675,6 +676,45 @@ curl -s -o /dev/null -w '%{http_code}\n' \
   $SERVICE/two-violation/tasks/$TID/instance
 # 期望: 404 / 404
 ```
+
+### 9.6 算法后处理主开关（`ALGO_VIOLATION_MODE`）
+
+> **部署级配置**，不是请求字段。该 env var 在 uvicorn 启动时（容器层）读取；同一容器内的所有任务共享同一模式。
+
+| 取值 | 含义 | 接受写法 |
+|---|---|---|
+| `on`（默认） | 模式 A：DBSCAN 之后按高度区间（`HAG_MAX_LOW_M` / `HAG_MIN_HIGH_M`）硬过滤中间层杂簇，再按 Gaussian 置信度（`CONFIDENCE_PEAK_N` / `CONFIDENCE_SIGMA_N`）排序保留的簇 | `on` / `1` / `true` / `yes` / `y`（大小写不敏感） |
+| `off` | 模式 B：legacy 行为——不剔除任何簇，直接按 `num_points` 从大到小排序 | `off` 及任何不被识别为 `on` 的字符串（含 `""`、`0`、`false`、`no`、乱写） |
+
+**对 `instances.json` 的影响**：
+
+| 字段 | 模式 A（`on`） | 模式 B（`off`） |
+|---|---|---|
+| `height_filter_enabled` | `true` | `false` |
+| `hag_max_low_m` / `hag_min_high_m` / `confidence_peak_n` / `confidence_sigma_n` | 数值 | `null` |
+| `n_clusters_before_height_filter` | 过滤前的簇数（通常 `> n_clusters`） | `null` |
+| `n_clusters` | 过滤后的簇数（`≤` 前者） | 等于过滤前（无任何剔除） |
+| 簇对象里的 `scenario` / `confidence_score` / `hag_min` / `hag_max` / `hag_mean` / `passed_height_filter` / `dbscan_label` | 存在 | **不存在**（与早期 legacy 输出同构） |
+
+`dtm_ground_count` / `dtm_quality` 在两种模式下**都正常出现**（是 Stage 2 的标量地面估计质量诊断，跟过滤模式无关）。
+
+**对后端 / 前端的影响**：
+
+- **后端不感知模式**：依旧只转发 `3dtilesUrl` / `instanceJsonUrl`；后端不需要写分支代码。
+- **前端 Cesium 已兼容**：`scripts/visualization/cesium.html` 只读 `id` / `bbox_*` / `hull_*` / `num_points`（legacy 字段）；新字段(`scenario` / `confidence_score` 等)即便存在也不消费。模式 B 时这些字段缺失不会报错。
+
+**运维用法**：
+
+```bash
+# 临时对单次任务切到 legacy 排序（在该次提交的子进程里临时注入）
+ALGO_VIOLATION_MODE=off nohup ... python -m uvicorn scripts.service.api_server:app ...
+
+# 改默认（影响所有不显式设置环境变量的运行；改动 algo_config.py L108）
+# 推荐改 shell 环境而非代码默认：
+echo 'export ALGO_VIOLATION_MODE=off' >> ~/.bashrc
+```
+
+详细设计与取舍见代码 PR 描述 / plan 文件 `~/.claude/plans/.../radiant-wilkes.md`。
 
 ---
 

@@ -51,6 +51,11 @@ CSF_BSLOOP_SMOOTH       = _env("ALGO_CSF_BSLOOP_SMOOTH",       "false").lower() 
 CSF_RIGIDNESS           = _env("ALGO_CSF_RIGIDNESS",           2)
 CSF_TIME_STEP           = _env("ALGO_CSF_TIME_STEP",           0.65)
 DTM_GRID_RES            = _env("ALGO_DTM_GRID_RES",            2.0)
+# 标量地面估计(Stage 2 的 cluster-filter 用,不影响 filter_vegetation.py
+# 的 CSF 流程):取 pts_b[:, 2] 底部 GROUND_PERCENTILE% 点的均值作为地面
+# 参考。城市建成区(地面点稀少)下,比 CSF 拟合 DTM 更稳健 —— CSF 容易
+# 把楼顶拟合成地面。默认 20% 与用户原话一致。
+GROUND_PERCENTILE       = _env("ALGO_GROUND_PERCENTILE",       20)
 MIN_VEG_HEIGHT_M        = _env("ALGO_MIN_VEG_HEIGHT_M",        0.5)
 MAX_VEG_HEIGHT_M        = _env("ALGO_MAX_VEG_HEIGHT_M",        20.0)
 EXG_THRESHOLD           = _env("ALGO_EXG_THRESHOLD",           0.05)
@@ -86,6 +91,28 @@ DBSCAN_VOXEL_M          = _env("ALGO_DBSCAN_VOXEL_M",          0.1)
 HULL_PARALLEL_MIN_N     = _env("ALGO_HULL_PARALLEL_MIN_N",     8)
 LAS_SCALE_M             = _env("ALGO_LAS_SCALE_M",             0.001)
 
+# ── Stage 4: 两违专用后置滤波 (violation filter) ─────────────────
+# 簇内所有点要么 ≤ HAG_MAX_LOW_M(违占 / 地面违建),要么 ≥ HAG_MIN_HIGH_M
+# (楼顶违建如阳光房);横跨 (HAG_MAX_LOW_M, HAG_MIN_HIGH_M) 区间的簇视为
+# 噪声 / 非两违,剔除。包含非有限值(NaN / inf)的簇 fail-closed,也剔除。
+# 默认 5 m / 20 m 与业务先验一致(地面违建 + 楼顶违建)。
+HAG_MAX_LOW_M           = _env("ALGO_HAG_MAX_LOW_M",           -99999)
+HAG_MIN_HIGH_M          = _env("ALGO_HAG_MIN_HIGH_M",         13)
+# Master switch for the 两违 post-filter inside cluster_instances.
+# "on"  (default): stage_convert passes bag.height_above_ground_diff
+#                   into cluster_instances → 跑 HAG 硬过滤 + Gaussian
+#                   置信度排序。
+# "off"           : stage_convert passes height_above_ground=None
+#                   → 走 legacy "全保留,按 num_points desc" 排序。
+# 接受 ("1","true","yes","y","on") 等价于 "on";其他值视为 "off"。
+VIOLATION_MODE          = _env("ALGO_VIOLATION_MODE", "on") \
+                          .strip().lower() in ("1", "true", "yes", "y", "on")
+# 置信度评分(高斯型):peak 在 CONFIDENCE_PEAK_N,sigma 控制衰减速度。
+# 默认:1100 点 → 1.0;800 / 1500 点 → 0.607;500 / 2000 → 0.135。
+# 当前是 heuristic,未在标注数据上校准 —— 不是真正的概率。
+CONFIDENCE_PEAK_N       = _env("ALGO_CONFIDENCE_PEAK_N",     1100)
+CONFIDENCE_SIGMA_N      = _env("ALGO_CONFIDENCE_SIGMA_N",     300)
+
 # ── Driver (run_pipeline.py) ─────────────────────────────────────
 PARALLEL_CPU_THRESHOLD  = _env("ALGO_PARALLEL_CPU_THRESHOLD",  4)
 
@@ -98,12 +125,17 @@ __all__ = [
     "CSF_CLOTH_RESOLUTION", "CSF_CLASS_THRESHOLD", "CSF_ITERATIONS",
     "CSF_SUBSAMPLE_RES", "CSF_BSLOOP_SMOOTH", "CSF_RIGIDNESS",
     "CSF_TIME_STEP", "DTM_GRID_RES",
+    "GROUND_PERCENTILE",
     "MIN_VEG_HEIGHT_M", "MAX_VEG_HEIGHT_M", "EXG_THRESHOLD",
     # nn_change_analysis
     "NN_MIN_DISTANCE_M", "NN_LEAFSIZE", "NN_CPU_FALLBACK",
     # convert_point_ecef_and_3dtiles
     "DBSCAN_EPS_M", "DBSCAN_MIN_POINTS", "DBSCAN_VOXEL_M",
     "HULL_PARALLEL_MIN_N", "LAS_SCALE_M",
+    # violation filter (Stage 4 post-DBSCAN)
+    "HAG_MAX_LOW_M", "HAG_MIN_HIGH_M",
+    "VIOLATION_MODE",
+    "CONFIDENCE_PEAK_N", "CONFIDENCE_SIGMA_N",
     # driver
     "PARALLEL_CPU_THRESHOLD",
 ]
