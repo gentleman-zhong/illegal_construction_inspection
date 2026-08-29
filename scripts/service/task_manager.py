@@ -68,6 +68,11 @@ class TaskStatus:
     position_mode: Optional[str] = None
     area_coordinates: Optional[list] = None
     radius: Optional[float] = None
+    # ----- 2026-08 新增: 三场景检测类型 -----
+    # 默认 "twoIllegal" 兼容老任务(无 detection_type 字段的历史 request.json);
+    # task_manager._spawn 会把这个值塞到子进程的 --detection-type argv;
+    # run_pipeline.py 据此覆盖 _CONFIG.VIOLATION_MODE。
+    detection_type: str = "twoIllegal"
     # Local path(s) of 3DTiles chunks. v1 algorithm produces one chunk
     # at <output_dir>/3DTiles; the list shape is the v2 hook for
     # chunked / progressive 3DTiles return.
@@ -126,7 +131,8 @@ class TaskStore:
                compare_model_path: str, xml_path: Optional[str],
                position_mode: Optional[str] = None,
                area_coordinates: Optional[list] = None,
-               radius: Optional[float] = None) -> TaskStatus:
+               radius: Optional[float] = None,
+               detection_type: str = "twoIllegal") -> TaskStatus:
         """Accept a new task. Raises :class:`BusyError` for concurrency /
         duplicate-id conflicts. Path existence is NOT validated here —
         ``run_pipeline_subprocess`` will mark the task FAILED with a clear
@@ -139,7 +145,17 @@ class TaskStore:
         ROI feature (Stage 1 / Stage 2 mask); ``position_mode`` and
         ``radius`` are informational / reserved respectively. All three
         are also archived to ``<out_dir>/request.json`` by the HTTP
-        layer."""
+        layer.
+
+        ``detection_type`` (2026-08 新增,三场景检测类型)同样透传给子进程;
+        algorithm 端据此覆盖 _CONFIG.VIOLATION_MODE。HTTP 层已经把缺失值
+        兜底为 "twoIllegal",这里再 normalize 一次兜底防直接调 store.submit
+        的代码路径。"""
+        # 防御性兜底: 缺失值归一为 "twoIllegal",保证历史调用点 / dispatcher
+        # 重启老任务时 TaskStatus.detection_type 一定有合法值。
+        if not detection_type:
+            detection_type = "twoIllegal"
+
         with self._lock:
             if task_id in self._status:
                 raise BusyError(f"task_id already exists: {task_id}")
@@ -159,6 +175,7 @@ class TaskStore:
                 position_mode=position_mode,
                 area_coordinates=area_coordinates,
                 radius=radius,
+                detection_type=detection_type,
             )
             self._status[task_id] = status
 
@@ -169,7 +186,7 @@ class TaskStore:
                     proc = self._spawn(
                         task_id, base_model_path, compare_model_path,
                         xml_path, position_mode, area_coordinates, radius,
-                        out_dir,
+                        detection_type, out_dir,
                     )
                 except Exception as e:
                     status.state = "FAILED"
@@ -279,7 +296,7 @@ class TaskStore:
                         status.task_id, status.base_model_path,
                         status.compare_model_path, status.xml_path,
                         status.position_mode, status.area_coordinates,
-                        status.radius, out_dir,
+                        status.radius, status.detection_type, out_dir,
                     )
                 except Exception as e:
                     status.state = "FAILED"
@@ -307,6 +324,7 @@ class TaskStore:
                position_mode: Optional[str],
                area_coordinates: Optional[list],
                radius: Optional[float],
+               detection_type: str,
                out_dir: Path) -> subprocess.Popen:
         wrapper = self.scripts_dir / "run_pipeline_subprocess.py"
         cmd = [
@@ -328,6 +346,10 @@ class TaskStore:
                     json.dumps(area_coordinates, ensure_ascii=False)]
         if radius is not None:
             cmd += ["--radius", str(radius)]
+        # ----- 2026-08 新增: 透传 detectionType (总是传,显式优于隐式) -----
+        # 缺省 fallback 在 submit() 里归一为 "twoIllegal",这里假定一定有值;
+        # 防御性兜底避免任何遗留代码路径让 detection_type 是 None。
+        cmd += ["--detection-type", detection_type or "twoIllegal"]
         log.info("[%s] spawning: %s", task_id, " ".join(cmd))
 
         # Make sure the subprocess can find CLI tools shipped in the same
@@ -672,6 +694,7 @@ class TaskStore:
                       if p in status.oss_chunk_urls]
         payload = {
             "taskId":          status.task_id,
+            "detectionType":   status.detection_type,    # 2026-08 新增
             "status":          status.state,        # SUCCESS 或 FAILED
             "progress":        str(status.progress),
             "3dtilesUrl":      tiles_urls or None,

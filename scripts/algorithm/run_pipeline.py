@@ -869,6 +869,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--radius", type=float, default=None,
                    help="Reserved for future use (e.g. outward buffer). "
                         "Currently logged and ignored.")
+    # ----- 2026-08 新增: 三场景检测类型 -----
+    # 映射到 _CONFIG.VIOLATION_MODE:
+    #   - "twoIllegal"           → on  (HAG 过滤 + Gaussian 置信度排序)
+    #   - "constructionProgress" → off (legacy num_points 排序)
+    #   - "landSlide"            → off (同上)
+    # 显式传 --detection-type 用于手工测试 / 直接调用本脚本绕过 HTTP 服务。
+    p.add_argument("--detection-type", default=None,
+                   choices=("twoIllegal", "constructionProgress", "landSlide"),
+                   help="Three-scenario detection type. None => 'twoIllegal' "
+                        "(backward-compat). Maps to _CONFIG.VIOLATION_MODE: "
+                        "'twoIllegal' → on, others → off.")
     return p.parse_args(argv)
 
 
@@ -926,6 +937,25 @@ def main(argv: list[str] | None = None) -> int:
         # /proc not available (e.g. macOS dev box) — degrade silently.
         # Worst case we just don't get a peak-RSS line in the log.
         print(f"[rss] sampler disabled: {_rss_exc}", flush=True)
+
+    # ─── detectionType → VIOLATION_MODE override ─────────────────────────
+    # 同一套三维差分对比管线服务三种场景:
+    #   - "twoIllegal"           → VIOLATION_MODE=on   (HAG 过滤 + 置信度排序)
+    #   - "constructionProgress" → VIOLATION_MODE=off  (legacy num_points 排序)
+    #   - "landSlide"            → VIOLATION_MODE=off  (同上)
+    # 未传 detectionType (CLI / 旧 request.json) 时按 "twoIllegal" 走,
+    # 保持向后兼容。覆盖的是 _CONFIG.VIOLATION_MODE 类属性(不是
+    # algo_config.VIOLATION_MODE,后者在 _CONFIG 类定义时已经复制过一次,
+    # 之后 _CONFIG.VIOLATION_MODE 是 class 上的独立属性)。
+    _detection_type = args.detection_type or "twoIllegal"
+    if _detection_type == "twoIllegal":
+        _CONFIG.VIOLATION_MODE = True
+    else:
+        # constructionProgress / landSlide / 任意未识别值(防御性)都关掉违建过滤
+        _CONFIG.VIOLATION_MODE = False
+    print(f"  [scenario] detectionType={_detection_type} → "
+          f"VIOLATION_MODE={'on' if _CONFIG.VIOLATION_MODE else 'off'}",
+          flush=True)
 
     # Single stage list — every entry carries (N/4 label, callable).
     # All stages now take their inputs from the bag (or kwargs) and

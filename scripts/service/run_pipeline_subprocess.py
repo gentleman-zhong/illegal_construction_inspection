@@ -126,6 +126,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Optional radius (meters). Reserved for future "
                         "use; currently logged and ignored by the "
                         "algorithm.")
+    # ----- 2026-08 新增: 三场景检测类型 -----
+    # task_manager._spawn 总是把这个参数加上;None 时按 "twoIllegal" 走。
+    p.add_argument("--detection-type", default=None,
+                   choices=("twoIllegal", "constructionProgress", "landSlide"),
+                   help="Three-scenario detection type. None => 'twoIllegal' "
+                        "(backward-compat). 'constructionProgress' and "
+                        "'landSlide' switch run_pipeline._CONFIG.VIOLATION_MODE "
+                        "off (legacy num_points-desc sort).")
     p.add_argument("--no-keep-intermediates", dest="keep_intermediates",
                    action="store_false", default=True)
     return p.parse_args(argv)
@@ -178,6 +186,9 @@ def main() -> int:
         argv += ["--area-coordinates", args.area_coordinates]
     if args.radius is not None:
         argv += ["--radius", str(args.radius)]
+    # 2026-08 新增: task_manager._spawn 总是透传 detection-type;
+    # 这里默认 "twoIllegal" (与 run_pipeline.py 内的 None → "twoIllegal" 对齐)。
+    argv += ["--detection-type", args.detection_type or "twoIllegal"]
 
     rc, err_msg = 0, ""
     try:

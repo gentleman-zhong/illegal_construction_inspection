@@ -38,7 +38,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 from urllib.parse import unquote
 
 # Allow `python scripts/service/api_server.py` as well as
@@ -188,6 +188,21 @@ class SubmitRequest(BaseModel):
                                                         "currently ignored by the "
                                                         "algorithm but archived to "
                                                         "<out_dir>/request.json.")
+    # ----- 2026-08 新增: 多场景检测类型 -----
+    # 三种场景共用同一套三维差分对比管线 (Stage 1-3),只在 Stage 4 后处理
+    # 路径上分叉:
+    #   - "twoIllegal"           : 现有逻辑 (HAG 过滤 + Gaussian 置信度排序)
+    #   - "constructionProgress" : 建筑工地施工进度监控 (legacy num_points 排序)
+    #   - "landSlide"            : 滑坡预警 (legacy num_points 排序)
+    # 缺失/None 一律按 "twoIllegal" 处理 (向后兼容,老客户端无需立即升级)。
+    # Pydantic Literal[...] 在收到未知值时返 HTTP 422。
+    detectionType:    Optional[Literal["twoIllegal", "constructionProgress", "landSlide"]] \
+                      = Field(None,
+                              description="Three-scenario enum. None / missing => "
+                                          "'twoIllegal' (backward-compat). "
+                                          "'constructionProgress' and 'landSlide' "
+                                          "switch Stage 4 post-processing to the "
+                                          "legacy num_points-desc sort.")
 
 
 # --------- model path resolution ---------
@@ -284,6 +299,7 @@ def _poll_ok(status) -> dict:
         "step":            status.step,
         "3dtilesUrl":      tiles_urls or None,
         "instanceJsonUrl": status.oss_instance_url,
+        "detectionType":   status.detection_type,
         "errorMessage":    None,
     }}
 
@@ -309,6 +325,7 @@ def _poll_fail(task_id: str, reason: str, status=None) -> dict:
         "step":            step,
         "3dtilesUrl":      tiles_urls or None,
         "instanceJsonUrl": instance_url,
+        "detectionType":   (status.detection_type if status is not None else "twoIllegal"),
         "errorMessage":    _truncate_error(reason),
     }}
 
@@ -341,14 +358,15 @@ def _archive_metadata(out_dir: Path, task_id: str,
                       compare_model_path: Optional[str] = None,
                       base_model_path_resolved: Optional[str] = None,
                       compare_model_path_resolved: Optional[str] = None,
+                      detection_type: Optional[str] = "twoIllegal",
                       submitted_at: Optional[str] = None) -> None:
     """Snapshot the full request payload to <out_dir>/request.json.
 
     Records both the original virtual paths (as submitted by the backend)
     and the resolved local filesystem paths (after ``resolve_model_path``),
-    plus the optional ROI / XML fields. Best-effort: write failure is
-    logged at WARNING but does not raise — a missing metadata file must
-    not block task submission."""
+    plus the optional ROI / XML / detectionType fields. Best-effort: write
+    failure is logged at WARNING but does not raise — a missing metadata
+    file must not block task submission."""
     payload = {
         "taskId":                  task_id,
         "submittedAt":             submitted_at,
@@ -362,6 +380,8 @@ def _archive_metadata(out_dir: Path, task_id: str,
         "positionMode":            position_mode,
         "areaCoordinates":         area_coordinates,
         "radius":                  radius,
+        # 三场景检测类型 (None ⇒ "twoIllegal" 默认;在 submit() 里统一过 or "twoIllegal")
+        "detectionType":           detection_type,
         # 仅在 xmlFile 提供时有值;否则 None
         "xmlPath":                 xml_path,
     }
@@ -480,6 +500,8 @@ def submit(req: SubmitRequest) -> dict:
     # 快照请求的全部内容到 <out_dir>/request.json，包含原始路径与解析后路径。
     # 算法本体可能消费 ROI 字段；其他字段为后续 hook 预留。和 _archive_xml
     # 一样 best-effort，失败不抛。
+    # detectionType: Pydantic Literal 已校验枚举;None 兜底为 "twoIllegal"。
+    _detection_type = req.detectionType or "twoIllegal"
     _archive_metadata(
         out_dir, req.taskId,
         req.positionMode, req.areaCoordinates, req.radius,
@@ -488,6 +510,7 @@ def submit(req: SubmitRequest) -> dict:
         compare_model_path=req.compareModelPath,
         base_model_path_resolved=str(base_path),
         compare_model_path_resolved=str(compare_path),
+        detection_type=_detection_type,
         submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
@@ -562,6 +585,7 @@ def submit(req: SubmitRequest) -> dict:
             position_mode=req.positionMode,
             area_coordinates=req.areaCoordinates,
             radius=req.radius,
+            detection_type=_detection_type,
         )
     except BusyError as e:
         return _submit_fail(req.taskId, str(e))

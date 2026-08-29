@@ -54,8 +54,8 @@ run_pipeline_subprocess.py  ──► <OUTPUT_BASE_DIR>/<taskId>/
 算法终态时（SUCCESS/FAILED）额外主动 POST 一次后端回调 URL（保底通知，主路径仍是后端轮询）
         │
         ▼
-POST http://192.168.4.20:8088/api/two-illegal-compare/tasks/callback
-body: { taskId, status, progress, 3dtilesUrl, instanceJsonUrl, errorMessage }
+POST https://api-test.ikingtec.com/fire-emergency/api/two-illegal-compare/tasks/callback
+body: { taskId, detectionType, status, progress, 3dtilesUrl, instanceJsonUrl, errorMessage }
 ```
 
 健康检查：`GET /healthz` → `200 {"status":"ok"}`
@@ -79,7 +79,7 @@ OpenAPI 文档：由 FastAPI 自动生成在 `/docs`（Swagger UI）和 `/openap
 
 > **当前部署：** 主机 `192.168.2.195`，服务通过 docker `-p 8901:8901` 暴露到 host 同一端口。响应里的 `3dtilesUrl` / `instanceJsonUrl` 是算法服务上传到 OSS 后回填的云端公共读 URL，后端可直接 `GET` 拉取，**算法服务不代理子文件下载**。OSS 配置在 `scripts/service/oss_config.json`（详见 §4.5 / OPERATIONS.md §4）。
 >
-> **主动回调（保底）：** 算法进入终态（SUCCESS / FAILED）后，算法服务会额外 POST 一次到后端的回调地址 `http://192.168.4.20:8088/api/two-illegal-compare/tasks/callback` —— **这是保底通知，主路径仍然是后端 GET 轮询**（见 §3）。回调丢失不影响轮询响应、不影响任务状态机；详见 §4.6。
+> **主动回调（保底）：** 算法进入终态（SUCCESS / FAILED）后，算法服务会额外 POST 一次到后端的回调地址 `https://api-test.ikingtec.com/fire-emergency/api/two-illegal-compare/tasks/callback` —— **这是保底通知，主路径仍然是后端 GET 轮询**（见 §3）。回调丢失不影响轮询响应、不影响任务状态机；详见 §4.6。
 
 ---
 
@@ -98,6 +98,7 @@ OpenAPI 文档：由 FastAPI 自动生成在 `/docs`（Swagger UI）和 `/openap
 | `positionMode` | string \| null | ❌ | 无验证 | 坐标系标识（如 `"WGS-84"`），落到 `<out>/request.json`；算法作为信息字段使用，不参与几何换算 |
 | `areaCoordinates` | list[dict] \| null | ❌ | 无验证，每个 dict 含 `{latitude, longitude, altitude}` 字段名；≥3 个顶点 | 感兴趣区 ROI 多边形顶点（WGS84）。**算法实际消费**：点云仅对 ROI 内的点做两违巡查；ROI 外的点与 cluster 全部丢弃。`radius` 当前忽略，仅存档 |
 | `radius` | float \| null | ❌ | 无验证 | 半径（米），落到 `<out>/request.json`；**预留**，算法当前忽略 |
+| `detectionType` | string \| null | ❌ | 枚举 `"twoIllegal"` / `"constructionProgress"` / `"landSlide"`；传其他值 → HTTP 422 | **v0.8+ 多场景检测类型**（详见 §9.7）。缺失/None 一律按 `"twoIllegal"` 处理（向后兼容）。`"twoIllegal"` 走 HAG 过滤 + Gaussian 置信度排序；`"constructionProgress"`（建筑工地施工进度）/ `"landSlide"`（滑坡预警）走 legacy num_points-desc 排序（**不剔除**中间层杂簇）。落到 `<out>/request.json`、回显在轮询响应 / 终态回调里 |
 
 **服务层不做路径存在性 / XML 大小校验。** 路径无效时提交仍返 `code: 0`，任务在子进程中报错后轮询端点会读出 `FAILED` + `errorMessage`。
 
@@ -206,7 +207,7 @@ curl -X POST http://192.168.2.195:8901/two-violation/compare \
 
 任意状态都返 `200`，业务码在 body `code` 字段。taskId 不存在时**不**返 HTTP 404，而是返 `code: 500` + `status: "FAILED"` + `errorMessage`。
 
-### 响应字段（`data` 里固定 7 项）
+### 响应字段（`data` 里固定 8 项）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -216,6 +217,7 @@ curl -X POST http://192.168.2.195:8901/two-violation/compare \
 | `step` | string | 当前阶段名（见下表） |
 | `3dtilesUrl` | list \| null | SUCCESS 时为 OSS 上 3D Tiles 根 URL 列表（v1 单元素，v2 多元素；RUNNING 时也可能部分填入已上传的 chunk）；**FAILED 时也可能非空**（部分 chunk 已上传时回填，给前端渐进显示用）；否则 `null` |
 | `instanceJsonUrl` | string \| null | SUCCESS 时为 OSS 上 `instances.json` 的公共读 URL；FAILED 时若已部分上传也会填；否则 `null` |
+| `detectionType` | string | **v0.8+**：回回显提交时的 `detectionType`（缺失时默认 `"twoIllegal"`）。FAILED 时也会带值（来自 `TaskStatus.detection_type`，未注册 taskId 走兜底 `"twoIllegal"`） |
 | `errorMessage` | string \| null | FAILED 时填失败原因；其余为 `null`。**最长 500 字符**（超长会截断为 `前 400 字 + 截断标记 + 后 80 字`）。完整 Python traceback 见服务容器内 `<OUTPUT_BASE_DIR>/<taskId>/error.log`（本服务内部,需要 SSH 进容器查看；后端拿不到) |
 
 ### 状态机（对外口径）
@@ -260,7 +262,8 @@ $ curl -s http://192.168.2.195:8901/two-violation/tasks/TW20260714000001
 {"code":0,"message":"success",
  "data":{"taskId":"TW20260714000001","progress":"30","status":"RUNNING",
          "step":"vegetation filtering",
-         "3dtilesUrl":null,"instanceJsonUrl":null,"errorMessage":null}}
+         "3dtilesUrl":null,"instanceJsonUrl":null,
+         "detectionType":"twoIllegal","errorMessage":null}}
 ```
 
 **SUCCESS：**
@@ -270,7 +273,7 @@ $ curl -s http://192.168.2.195:8901/two-violation/tasks/TW20260714000001
  "data":{"taskId":"TW20260714000001","progress":"100","status":"SUCCESS","step":"completed",
          "3dtilesUrl":["https://oss.ikingtec.com/hushi-test/illegal-compare/TW20260714000001/3DTiles/tileset.json"],
          "instanceJsonUrl":"https://oss.ikingtec.com/hushi-test/illegal-compare/TW20260714000001/instance.json",
-         "errorMessage":null}}
+         "detectionType":"twoIllegal","errorMessage":null}}
 ```
 
 **FAILED（子进程报错）：**
@@ -279,6 +282,7 @@ $ curl -s http://192.168.2.195:8901/two-violation/tasks/TW-BAD-PATH
 {"code":500,"message":"failed",
  "data":{"taskId":"TW-BAD-PATH","progress":"0","status":"FAILED","step":"waiting",
          "3dtilesUrl":null,"instanceJsonUrl":null,
+         "detectionType":"twoIllegal",
          "errorMessage":"taskId not found: TW-BAD-PATH"}}
 ```
 
@@ -288,6 +292,7 @@ $ curl -s http://192.168.2.195:8901/two-violation/tasks/TW-NOT-EXIST
 {"code":500,"message":"failed",
  "data":{"taskId":"TW-NOT-EXIST","progress":"0","status":"FAILED","step":"waiting",
          "3dtilesUrl":null,"instanceJsonUrl":null,
+         "detectionType":"twoIllegal",
          "errorMessage":"taskId not found: TW-NOT-EXIST"}}
 ```
 
@@ -359,13 +364,14 @@ http://10.230.0.5:8009/hushi-test/illegal-compare/<taskId>/3DTiles/tileset.json
 
 #### 4.6.2 接口契约
 
-- **URL**：`POST http://192.168.4.20:8088/api/two-illegal-compare/tasks/callback`（在 `oss_config.json` 的 `backend_callback_url` 配置；空字符串 = 禁用回调）
+- **URL**：`POST https://api-test.ikingtec.com/fire-emergency/api/two-illegal-compare/tasks/callback`（在 `oss_config.json` 的 `backend_callback_url` 配置；空字符串 = 禁用回调）
 - **Content-Type**：`application/json`
 - **Body schema**：
 
   | 字段 | 类型 | 说明 |
   |---|---|---|
   | `taskId` | string | 同提交 |
+  | `detectionType` | string | **v0.8+**：回显提交时的 `detectionType`（缺失时默认 `"twoIllegal"`） |
   | `status` | enum | **只 `SUCCESS` 或 `FAILED`**；不带 RUNNING/PENDING |
   | `progress` | string | `"0"`～`"100"`；SUCCESS 时 `"100"`，FAILED 时为失败时的进度 |
   | `3dtilesUrl` | list \| null | 已上传到 OSS 的 chunk URL 列表（按算法产出顺序）；全无则 `null`；FAILED 时也可能非空（partial） |
@@ -378,6 +384,7 @@ http://10.230.0.5:8009/hushi-test/illegal-compare/<taskId>/3DTiles/tileset.json
   // SUCCESS
   {
     "taskId": "20260715103045A1B2C3",
+    "detectionType": "twoIllegal",
     "status": "SUCCESS",
     "progress": "100",
     "3dtilesUrl": [
@@ -391,6 +398,7 @@ http://10.230.0.5:8009/hushi-test/illegal-compare/<taskId>/3DTiles/tileset.json
   // FAILED
   {
     "taskId": "20260715103045A1B2C3",
+    "detectionType": "landSlide",
     "status": "FAILED",
     "progress": "20",
     "3dtilesUrl": null,
@@ -572,9 +580,9 @@ const instances = await fetch(instanceUrl).then(r => r.json());
 | OSS bucket | `hushi-test` |
 | OSS key prefix | `illegal-compare/<taskId>/...` |
 | OSS 配置文件 | `scripts/service/oss_config.json`（覆盖用 `OSS_CONFIG` 环境变量） |
-| 后端回调 URL（保底） | `http://192.168.4.20:8088/api/two-illegal-compare/tasks/callback` |
+| 后端回调 URL（保底） | `https://api-test.ikingtec.com/fire-emergency/api/two-illegal-compare/tasks/callback`（`oss_config.json` 的 `backend_callback_url`） |
 | 回调超时 / 重试 | `callback_timeout_seconds=10`、`callback_max_retries=3`（均在 `oss_config.json`） |
-| 算法后处理主开关 | `ALGO_VIOLATION_MODE=on`（默认） / `off`（见 §9.6） |
+| 算法后处理主开关 | `ALGO_VIOLATION_MODE=on`（默认） / `off`（见 §9.6）；**v0.8+ 由 `detectionType` 自动覆盖**：`"twoIllegal"` → on，`"constructionProgress"` / `"landSlide"` → off（见 §9.7） |
 
 ### 9.2 SSH 接入
 
@@ -715,6 +723,51 @@ echo 'export ALGO_VIOLATION_MODE=off' >> ~/.bashrc
 ```
 
 详细设计与取舍见代码 PR 描述 / plan 文件 `~/.claude/plans/.../radiant-wilkes.md`。
+
+---
+
+### 9.7 多场景检测类型（`detectionType`，v0.8+）
+
+> **请求级字段**。同一算法服务实例同时支持三种检测场景：每个任务在 `POST /two-violation/compare` 时通过 `detectionType` 字段显式声明场景，算法据此切换 Stage 4 后处理路径。**不要**改 `ALGO_VIOLATION_MODE` env var 来实现场景切换——它在 uvicorn 启动时读取，会影响所有任务。
+
+| `detectionType` | 场景 | 算法行为 | `instances.json` |
+|---|---|---|---|
+| `"twoIllegal"`（默认） | 两违巡查（违占 / 违建） | `VIOLATION_MODE=on`：DBSCAN 之后按高度区间（`HAG_MAX_LOW_M` / `HAG_MIN_HIGH_M`）硬过滤中间层杂簇，再按 Gaussian 置信度排序 | `height_filter_enabled: true`，含 `scenario` / `confidence_score` / `hag_*` 字段 |
+| `"constructionProgress"` | 建筑工地施工进度监控 | `VIOLATION_MODE=off`：legacy 行为——不剔除任何簇，按 `num_points` 从大到小排序 | `height_filter_enabled: false`，簇对象不写 `scenario` / `confidence_score` |
+| `"landSlide"` | 滑坡预警 | `VIOLATION_MODE=off`：同 `constructionProgress` | 同上 |
+
+**契约**：
+
+| 项 | 行为 |
+|---|---|
+| 字段缺失 / `null` | 默认 `"twoIllegal"`（向后兼容，老客户端无需升级） |
+| 字段值非法（不在枚举里） | HTTP 422（走 Pydantic `Literal[...]` 校验，不是业务码） |
+| 轮询响应 `data.detectionType` | 回显提交时的值；FAILED 时也带值；taskId 未注册走兜底 `"twoIllegal"` |
+| 终态回调 `detectionType` 字段 | 与轮询响应同源（来自 `TaskStatus.detection_type`） |
+| 落盘 `<out>/request.json` | 同步存档（与 `positionMode` / `areaCoordinates` / `radius` 同一风格） |
+
+**三种场景共用同一套三维差分对比管线**（Stage 1 点云提取 → Stage 2 植被过滤 → Stage 3 NN 变化检测 → Stage 4 DBSCAN 聚类）；**只在 Stage 4 后处理路径上分叉**——`"twoIllegal"` 走 HAG 过滤 + 置信度排序；其他两种走 legacy "全保留 + num_points desc"。
+
+**对后端 / 前端的影响**：
+
+- **后端**：提交时按业务类型带上对应 `detectionType`；轮询 / 回调响应里读 `detectionType` 字段来识别产物属于哪种场景（可选用；前端不依赖此字段做逻辑判断）。
+- **前端 Cesium**：所有模式走同一套字段集渲染（`id` / `bbox_*` / `hull_*` / `num_points`）；模式 B 时新字段缺失不报错。
+
+**手工测试**（不通过 HTTP 层）：
+
+```bash
+# 直接调算法端,绕过服务
+cd /root/illegal_construction_inspection
+./run_pipeline.sh <request.json>
+# request.json 内 detectionType 缺失 ⇒ 默认 "twoIllegal"
+# 也可直接:
+./scripts/algorithm/run_pipeline.py \
+    <base-tileset> <compare-tileset> \
+    -o <out-dir> \
+    --detection-type landSlide
+# 算法日志第一行会打印:
+#   [scenario] detectionType=landSlide → VIOLATION_MODE=off
+```
 
 ---
 

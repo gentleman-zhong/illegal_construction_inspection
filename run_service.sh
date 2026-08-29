@@ -23,6 +23,10 @@ ALGO_DISABLE_OOM_PREFLIGHT="${ALGO_DISABLE_OOM_PREFLIGHT:-1}"
 # 峰值,仍在 64 GiB cgroup 内)换更精细的 cluster 形状 / 边界恢复率。
 # 想恢复 0.5 m 老行为: 启动前设 ALGO_DBSCAN_VOXEL_M=0.5; 完全关掉:设 0
 ALGO_DBSCAN_VOXEL_M="${ALGO_DBSCAN_VOXEL_M:-0.1}"
+# 2026-07-30: Stage 1 内层 worker 数从默认 8 提到 64。128 核机器上老的 8 让
+# Pass 2 的并行度卡到 6% 整机利用率 (R2 in plan file)。把 64 写死成部署默认;
+# 想恢复老行为: 启动前设 ALGO_EXTRACT_MAX_WORKERS=8 (开发机 4-8 核也安全)。
+ALGO_EXTRACT_MAX_WORKERS="${ALGO_EXTRACT_MAX_WORKERS:-64}"
 PID_FILE="$REPO_ROOT/service.pid"
 LOG_FILE="$REPO_ROOT/service.log"
 UVICORN_PATTERN="uvicorn scripts.service.api_server"
@@ -51,11 +55,11 @@ start_service() {
         return 0
     fi
 
-    echo "启动服务 (port=$PORT, OUTPUT_BASE_DIR=$OUTPUT_BASE_DIR, MODEL_ROOT=$MODEL_ROOT, ALGO_DISABLE_OOM_PREFLIGHT=$ALGO_DISABLE_OOM_PREFLIGHT, ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M) ..."
+    echo "启动服务 (port=$PORT, OUTPUT_BASE_DIR=$OUTPUT_BASE_DIR, MODEL_ROOT=$MODEL_ROOT, ALGO_DISABLE_OOM_PREFLIGHT=$ALGO_DISABLE_OOM_PREFLIGHT, ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M, ALGO_EXTRACT_MAX_WORKERS=$ALGO_EXTRACT_MAX_WORKERS) ..."
     mkdir -p "$(dirname "$OUTPUT_BASE_DIR")"
 
     # 同时 export 一份,启动后用 /proc/<pid>/environ 校验 env 真的进了子进程
-    export OUTPUT_BASE_DIR LOG_LEVEL PORT MODEL_ROOT ALGO_DISABLE_OOM_PREFLIGHT ALGO_DBSCAN_VOXEL_M
+    export OUTPUT_BASE_DIR LOG_LEVEL PORT MODEL_ROOT ALGO_DISABLE_OOM_PREFLIGHT ALGO_DBSCAN_VOXEL_M ALGO_EXTRACT_MAX_WORKERS
     nohup "$PY" -m uvicorn scripts.service.api_server:app \
         --host 0.0.0.0 --port "$PORT" --workers 1 \
         > "$LOG_FILE" 2>&1 &
@@ -79,6 +83,12 @@ start_service() {
             echo "env OK: ALGO_DBSCAN_VOXEL_M=$ALGO_DBSCAN_VOXEL_M"
         else
             echo "WARNING: ALGO_DBSCAN_VOXEL_M not in /proc/$pid/environ"
+            env_ok=0
+        fi
+        if grep -q "^ALGO_EXTRACT_MAX_WORKERS=$ALGO_EXTRACT_MAX_WORKERS$" /proc/$pid/environ 2>/dev/null; then
+            echo "env OK: ALGO_EXTRACT_MAX_WORKERS=$ALGO_EXTRACT_MAX_WORKERS"
+        else
+            echo "WARNING: ALGO_EXTRACT_MAX_WORKERS not in /proc/$pid/environ"
             env_ok=0
         fi
         if command -v curl > /dev/null; then
