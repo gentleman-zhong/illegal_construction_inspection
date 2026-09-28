@@ -1,0 +1,18 @@
+{
+  "endpoint":      "http://10.230.0.5:8009",
+  "access_key":    "123",
+  "secret_key":    "123",
+  "bucket":        "hushi-test",
+  "public_base":   "https://oss.ikingtec.com/hushi-test",
+  "key_prefix":    "illegal-compare",
+  "region":        "us-east-1",
+  "use_presigned": false,
+  "max_workers":   4,
+
+  "backend_callback_url":     "https://api-test.ikingtec.com/fire-emergency/api/two-illegal-compare/tasks/callback",
+  "callback_timeout_seconds": 10,
+  "callback_max_retries":     3,
+
+  "_comment_concurrency": "2026-07 多任务并行: 同时跑几个 task。env MAX_CONCURRENT_TASKS 可覆盖。N=1 退化为单飞(fast-path,行为完全等同旧版)。",
+  "max_concurrent_tasks":    4
+}
