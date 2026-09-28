@@ -16,6 +16,12 @@
 #   ./run_pipeline.sh output/<taskId>/request.json
 #   ./run_pipeline.sh output/20260811170311EF8936/request.json
 #
+# The detection scene is read from request.json's `detectionType` field.
+# Historical requests without that field default to `twoIllegal`. It can
+# still be overridden for a one-off manual run with, for example:
+#   ./run_pipeline.sh output/<taskId>/request.json \
+#       --detection-type landSlide
+#
 # Output (default: <taskId>/):
 #   <taskId>/intermediates/    — every stage's PLY + .npy
 #   <taskId>/final.3dtiles/    — final 3D Tiles
@@ -142,25 +148,39 @@ fi
 # ───────────────────────────────────────────────────────────────────────
 # Parse request.json (using Python — keeps JSON parsing robust to quoting)
 # ───────────────────────────────────────────────────────────────────────
-read -r TASK_ID BASE_MODEL COMPARE_MODEL POSITION_MODE RADIUS AREA_JSON < <(
+mapfile -t REQUEST_FIELDS < <(
     "$PYTHON_BIN" - "$REQ_JSON" <<'PY'
 import json, sys
 req = json.load(open(sys.argv[1]))
 def coalesce(*vals):
     for v in vals:
         if v is not None and v != "":
-            return v
+            return str(v)
     return ""
-print(
+values = (
     req.get("taskId", ""),
     coalesce(req.get("baseModelPathResolved"), req.get("baseModelPath")),
     coalesce(req.get("compareModelPathResolved"), req.get("compareModelPath")),
     req.get("positionMode") or "",
     str(req.get("radius") or ""),
+    req.get("detectionType") or "twoIllegal",
     json.dumps(req.get("areaCoordinates") or []),
 )
+print(*values, sep="\n")
 PY
 )
+
+if [[ ${#REQUEST_FIELDS[@]} -ne 7 ]]; then
+    echo "FATAL: failed to parse the expected fields from request.json" >&2
+    exit 1
+fi
+TASK_ID="${REQUEST_FIELDS[0]}"
+BASE_MODEL="${REQUEST_FIELDS[1]}"
+COMPARE_MODEL="${REQUEST_FIELDS[2]}"
+POSITION_MODE="${REQUEST_FIELDS[3]}"
+RADIUS="${REQUEST_FIELDS[4]}"
+DETECTION_TYPE="${REQUEST_FIELDS[5]}"
+AREA_JSON="${REQUEST_FIELDS[6]}"
 
 if [[ -z "$TASK_ID" ]]; then
     echo "FATAL: request.json has no 'taskId' field" >&2
@@ -170,6 +190,17 @@ if [[ -z "$BASE_MODEL" || -z "$COMPARE_MODEL" ]]; then
     echo "FATAL: request.json missing baseModelPath/compareModelPath" >&2
     exit 1
 fi
+
+case "$DETECTION_TYPE" in
+    twoIllegal|constructionProgress|landSlide)
+        ;;
+    *)
+        echo "FATAL: invalid detectionType in request.json: $DETECTION_TYPE" >&2
+        echo "       expected one of: twoIllegal, constructionProgress, landSlide" >&2
+        exit 1
+        ;;
+esac
+
 if [[ ! -d "$BASE_MODEL" ]]; then
     echo "FATAL: base tileset dir does not exist: $BASE_MODEL" >&2
     exit 2
@@ -189,6 +220,7 @@ echo "baseModelPath     : $BASE_MODEL"
 echo "compareModelPath  : $COMPARE_MODEL"
 echo "positionMode      : ${POSITION_MODE:-<unset>}"
 echo "radius            : ${RADIUS:-<unset>}"
+echo "detectionType     : $DETECTION_TYPE"
 echo "areaCoordinates   : $AREA_JSON"
 echo "out_dir           : $OUT_DIR"
 echo "log_file          : $LOG_FILE"
@@ -220,6 +252,7 @@ PIPELINE_ARGS=(
     -o "$OUT_DIR"
     "$KEEP_FLAG"
     --area-coordinates "$AREA_JSON"
+    --detection-type "$DETECTION_TYPE"
 )
 if [[ -n "$POSITION_MODE" ]]; then
     PIPELINE_ARGS+=(--position-mode "$POSITION_MODE")

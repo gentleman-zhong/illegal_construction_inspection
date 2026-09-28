@@ -72,7 +72,7 @@ import laspy
 import subprocess
 import shutil
 from typing import Optional, Dict, Any
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from algo_config import (      # noqa: E402
@@ -384,6 +384,10 @@ def cluster_instances(
       can be empty when open3d cannot compute a hull (e.g. < 4
       non-coplanar points), in which case the consumer should fall back
       to ``bbox_*`` rendering.
+    - ``footprint_area_m2`` — area of the cluster's ENU East/North
+      projection convex hull, in square metres.
+    - ``volume_m3`` — volume enclosed by the rendered 3D convex hull,
+      in cubic metres.
 
     When ``height_above_ground`` is supplied, the **两违 (illegal-occupation /
     illegal-construction) post-filter** is applied:
@@ -694,6 +698,36 @@ def cluster_instances(
     return clusters, labels, n_before_filter
 
 
+def _hull_metrics(
+    hull_vertices_ecef: np.ndarray,
+    hull_triangles: np.ndarray,
+    pts_enu: np.ndarray,
+) -> tuple[float, float]:
+    """Return horizontal footprint area and enclosed convex-hull volume.
+
+    ``pts_enu`` is projected to its native East/North plane so the area is
+    a local-horizontal footprint in square metres.  The convex hull itself
+    is stored in ECEF for Cesium; translate its vertices to a local origin
+    before the tetrahedron sum so large ECEF coordinates do not degrade the
+    volume calculation.
+    """
+    try:
+        # In 2D, scipy's ``volume`` property is the polygon area.
+        footprint_area_m2 = float(ConvexHull(pts_enu[:, :2]).volume)
+    except QhullError:
+        # A vertically aligned cluster can have a valid 3D hull but a
+        # degenerate (collinear) horizontal projection.
+        footprint_area_m2 = 0.0
+
+    local_vertices = hull_vertices_ecef - hull_vertices_ecef.mean(axis=0)
+    a = local_vertices[hull_triangles[:, 0]]
+    b = local_vertices[hull_triangles[:, 1]]
+    c = local_vertices[hull_triangles[:, 2]]
+    signed_six_volume = np.einsum("ij,ij->i", a, np.cross(b, c)).sum()
+    volume_m3 = float(abs(signed_six_volume) / 6.0)
+    return footprint_area_m2, volume_m3
+
+
 def _hull_one_cluster(
     cid_0based: int,
     pts_ecef: np.ndarray,
@@ -728,6 +762,9 @@ def _hull_one_cluster(
         hull_mesh = hull_result
     hull_vertices = np.asarray(hull_mesh.vertices, dtype=np.float64)
     hull_triangles = np.asarray(hull_mesh.triangles, dtype=np.int64)
+    footprint_area_m2, volume_m3 = _hull_metrics(
+        hull_vertices, hull_triangles, pts_enu,
+    )
 
     return cid_0based, {
         "id": cid_0based + 1,  # 1-based for the user-facing JSON
@@ -738,6 +775,8 @@ def _hull_one_cluster(
         "bbox_size": bbox_size.tolist(),
         "hull_vertices_ecef": hull_vertices.tolist(),
         "hull_triangles": hull_triangles.tolist(),
+        "footprint_area_m2": footprint_area_m2,
+        "volume_m3": volume_m3,
     }
 
 

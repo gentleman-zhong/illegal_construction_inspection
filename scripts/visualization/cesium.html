@@ -52,7 +52,7 @@
     // 聚类显示分两类,可独立勾选
     const clusterDisplay = {
       bbox: [],   // 每个 cluster 一个 AABB box entity
-      hull: [],   // 每个 cluster ~300 个三角形 polyline + 1 个 label entity
+      hull: [],   // 每个 cluster 一个半透明凸包 mesh
     };
 
     // —— 1. 加载城市网格 3D Tiles ——
@@ -79,7 +79,7 @@
       setStatus('正在加载点云 3D Tiles…');
       try {
         const ts = await Cesium.Cesium3DTileset.fromUrl(
-          '../../output/2026081816314570EACB/3DTiles/tileset.json'
+          '../../output/202609141457142636EA/3DTiles/tileset.json'
         );
         viewer.scene.primitives.add(ts);
         await ts.readyPromise;
@@ -162,7 +162,7 @@
     async function loadClusters() {
       setStatus('正在加载聚类结果…');
       try {
-        const resp = await fetch('../../output/202608151432205B07CD/instances.json');
+        const resp = await fetch('../../output/202609141457142636EA/instances.json');
         const data = await resp.json();
         const n = data.n_clusters;
         console.log(`[Cluster] eps=${data.eps}, min_points=${data.min_points}, n_clusters=${n}, n_input=${data.n_input_points}`);
@@ -172,6 +172,7 @@
           const hue = ((c.id - 1) / Math.max(n, 1) + 0.02) % 1.0;
           const fillColor  = Cesium.Color.fromHsl(hue, 0.85, 0.50, 0.22);
           const outlineCol = Cesium.Color.fromHsl(hue, 1.00, 0.55, 1.00);
+          const hullColor  = new Cesium.Color(1.0, 0.0, 0.0, 0.55);
 
           const center = new Cesium.Cartesian3(
             c.bbox_center_ecef[0],
@@ -204,34 +205,11 @@
           clusterDisplay.bbox.push(bboxEntity);
 
           // —— 凸包:半透明填充 mesh(Primitive),默认显示 ——
-          const hullPrim = makeHullPrimitive(c, fillColor);
+          const hullPrim = makeHullPrimitive(c, hullColor);
           if (hullPrim) {
             viewer.scene.primitives.add(hullPrim);
             clusterDisplay.hull.push(hullPrim);
           }
-
-          // —— label:跟凸包一起显示 ——
-          const labelEntity = viewer.entities.add({
-            name: `cluster_${c.id}_label`,
-            position: center,
-            label: {
-              text: `#${c.id} · ${c.num_points.toLocaleString()} pts\n${c.hull_vertices_ecef.length} verts · ${c.hull_triangles.length} tris`,
-              font: 'bold 13px sans-serif',
-              fillColor: Cesium.Color.WHITE,
-              outlineColor: Cesium.Color.BLACK,
-              outlineWidth: 3,
-              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-              showBackground: true,
-              backgroundColor: new Cesium.Color(0, 0, 0, 0.55),
-              backgroundPadding: new Cesium.Cartesian2(8, 4),
-              pixelOffset: new Cesium.Cartesian2(0, -12),
-              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-              horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-              distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 2000),
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            },
-          });
-          clusterDisplay.hull.push(labelEntity);
         }
         setStatus(`聚类结果已加载 · ${n} 个 cluster`);
         return data;
@@ -266,7 +244,7 @@
       loadMeshTiles(),
       loadMeshTilesB(),
       loadPointTiles(),
-      // loadClusters(),
+      loadClusters(),
     ]);
 
     // —— 4. UI 事件 ——
