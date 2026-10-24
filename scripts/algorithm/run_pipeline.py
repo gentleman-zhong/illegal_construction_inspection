@@ -771,6 +771,44 @@ def stage_convert(*, bag: _Bag, out_dir: Path, inter_dir: Path | None) -> None:
           f"clusters={len(clusters_pre)}",
           flush=True)
 
+    # A valid inspection can have no qualifying region: either DBSCAN
+    # found no dense change cluster, or the two-illegal HAG rule removed
+    # every cluster below the configured rooftop threshold.  This is a
+    # successful empty result, not a LAS/3D-Tiles conversion error.
+    if n_kept == 0:
+        write_instances_json(
+            out_dir / "instances.json",
+            [],
+            eps=_CONFIG.DBSCAN_EPS_M,
+            min_points=_CONFIG.DBSCAN_MIN_POINTS,
+            n_input_points=n_total,
+            height_filter_enabled=(hag_diff is not None),
+            hag_max_low_m=(
+                _CONFIG.HAG_MAX_LOW_M if hag_diff is not None else None
+            ),
+            hag_min_high_m=(
+                _CONFIG.HAG_MIN_HIGH_M if hag_diff is not None else None
+            ),
+            confidence_peak_n=(
+                _CONFIG.CONFIDENCE_PEAK_N if hag_diff is not None else None
+            ),
+            confidence_sigma_n=(
+                _CONFIG.CONFIDENCE_SIGMA_N if hag_diff is not None else None
+            ),
+            n_clusters_before_height_filter=(
+                n_clusters_before_filter if hag_diff is not None else None
+            ),
+            dtm_ground_count=dtm_ground_count,
+        )
+        print("  no qualifying clusters; wrote empty instances.json",
+              flush=True)
+        bag.pts_diff                  = None
+        bag.rgb_diff                  = None
+        bag.transform_b               = None
+        bag.height_above_ground_diff  = None
+        bag.dtm_ground_count          = None
+        return
+
     # 4. Direct ECEF → LAS (skip the PLY round-trip — the open3d PLY
     #    reader is the slow part of save_ecef_ply_to_las).
     tmp_las = out_dir / (".ecef_temp.las" if inter_dir is None

@@ -550,7 +550,7 @@ def cluster_instances(
     # to the "kept" subset, then hull-only is run on those.
     cluster_records: list[dict] | None = None
     rejected_cids: set[int] = set()
-    if height_above_ground is not None and n_clusters > 0:
+    if height_above_ground is not None:
         cluster_records = []
         for cid_0based in unique_labels:
             mask = labels == cid_0based

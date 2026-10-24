@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field                                           
 
 from oss_uploader import OssUploader, load_config                                         # noqa: E402
 from task_manager import BusyError, TaskStore                                             # noqa: E402
+from error_policy import PUBLIC_FAILURE_MESSAGE  # noqa: E402
 try:
     # Pre-flight estimator — see Priority 4.  Imports are wrapped so a
     # missing scipy (developer box without the prod conda env) does
@@ -277,8 +278,9 @@ def _submit_ok(task_id: str) -> dict:
 
 
 def _submit_fail(task_id: str, reason: str) -> dict:
+    log.error("[%s] submit rejected: %s", task_id, reason)
     return {"code": 500, "message": "failed",
-            "data": {"taskId": task_id, "status": "FAILED", "errorMessage": _truncate_error(reason)}}
+            "data": {"taskId": task_id, "status": "FAILED", "errorMessage": PUBLIC_FAILURE_MESSAGE}}
 
 
 def _poll_ok(status) -> dict:
@@ -305,6 +307,8 @@ def _poll_ok(status) -> dict:
 
 
 def _poll_fail(task_id: str, reason: str, status=None) -> dict:
+    if status is None:
+        log.warning("[%s] task query failed: %s", task_id, reason)
     # FAILED 时若 _scan_partial_outputs 已经成功上了一些 chunk，
     # 3dtilesUrl / instanceJsonUrl 也回填给前端（与 callback 行为一致；
     # 用于渐进显示——前端先看已上传的 chunk、再看 errorMessage）。
@@ -326,7 +330,7 @@ def _poll_fail(task_id: str, reason: str, status=None) -> dict:
         "3dtilesUrl":      tiles_urls or None,
         "instanceJsonUrl": instance_url,
         "detectionType":   (status.detection_type if status is not None else "twoIllegal"),
-        "errorMessage":    _truncate_error(reason),
+        "errorMessage":    PUBLIC_FAILURE_MESSAGE,
     }}
 
 
@@ -478,6 +482,9 @@ def submit(req: SubmitRequest) -> dict:
     time. Bad paths surface as FAILED + errorMessage on the poll
     endpoint after the algorithm subprocess reads them.
     """
+    if store.get(req.taskId) is not None:
+        return _submit_fail(req.taskId, f"task_id already exists: {req.taskId}")
+
     out_dir = OUTPUT_BASE / req.taskId
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -494,7 +501,7 @@ def submit(req: SubmitRequest) -> dict:
             req.taskId, base_path, compare_path,
         )
     except Exception as e:
-        log.exception("path resolve failed")
+        log.exception("[%s] path resolve failed", req.taskId)
         return _submit_fail(req.taskId, f"path resolve failed: {e}")
 
     # 快照请求的全部内容到 <out_dir>/request.json，包含原始路径与解析后路径。
@@ -590,7 +597,7 @@ def submit(req: SubmitRequest) -> dict:
     except BusyError as e:
         return _submit_fail(req.taskId, str(e))
     except Exception as e:
-        log.exception("submit failed")
+        log.exception("[%s] submit failed", req.taskId)
         return _submit_fail(req.taskId, f"submit failed: {e}")
 
     return _submit_ok(req.taskId)

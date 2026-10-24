@@ -55,9 +55,9 @@ def test_voxel_decimate_matches_undecimated_cluster_count():
     pts = _synth_clusters(n_clusters=5, pts_per_cluster=2000, noise=200)
     ecef = pts.copy()  # identity — only the ENU side matters for DBSCAN
 
-    undec, _ = cluster_instances(pts, ecef, eps=2.5, min_points=20,
+    undec, _, _ = cluster_instances(pts, ecef, eps=2.5, min_points=20,
                                   voxel_m=0.0)
-    dec, _    = cluster_instances(pts, ecef, eps=2.5, min_points=20,
+    dec, _,    _ = cluster_instances(pts, ecef, eps=2.5, min_points=20,
                                   voxel_m=0.5)
 
     n_undec = len(undec)
@@ -93,7 +93,7 @@ def test_voxel_0_1_decimation_ratio_and_label_shape():
     pts = _synth_clusters(n_clusters=5, pts_per_cluster=2000, noise=200)
     ecef = pts.copy()
 
-    clusters, labels = cluster_instances(
+    clusters, labels, _ = cluster_instances(
         pts, ecef, eps=2.5, min_points=20, voxel_m=0.1,
     )
 
@@ -128,9 +128,9 @@ def test_voxel_decimate_centroid_within_one_voxel():
     ecef = pts.copy()
 
     voxel = 0.3
-    undec, _ = cluster_instances(pts, ecef, eps=2.0, min_points=20,
+    undec, _, _ = cluster_instances(pts, ecef, eps=2.0, min_points=20,
                                   voxel_m=0.0)
-    dec, _    = cluster_instances(pts, ecef, eps=2.0, min_points=20,
+    dec, _,    _ = cluster_instances(pts, ecef, eps=2.0, min_points=20,
                                   voxel_m=voxel)
 
     # Match undec clusters to dec clusters by closest-centroid.
@@ -155,9 +155,9 @@ def test_voxel_decimate_label_back_propagation_deterministic():
     pts = _synth_clusters(n_clusters=4, pts_per_cluster=800, noise=200)
     ecef = pts.copy()
 
-    _, labels_a = cluster_instances(pts, ecef, eps=2.5, min_points=20,
+    _, labels_a, _ = cluster_instances(pts, ecef, eps=2.5, min_points=20,
                                     voxel_m=0.4)
-    _, labels_b = cluster_instances(pts, ecef, eps=2.5, min_points=20,
+    _, labels_b, _ = cluster_instances(pts, ecef, eps=2.5, min_points=20,
                                     voxel_m=0.4)
     np.testing.assert_array_equal(labels_a, labels_b)
 
@@ -170,7 +170,7 @@ def test_voxel_decimate_memory_smoke():
     ecef = pts.copy()
 
     t0 = time.time()
-    clusters, labels = cluster_instances(pts, ecef, eps=2.5,
+    clusters, labels, _ = cluster_instances(pts, ecef, eps=2.5,
                                           min_points=30, voxel_m=0.5)
     elapsed = time.time() - t0
 
@@ -203,7 +203,7 @@ def test_cluster_instances_accepts_f32_input():
     # The fix must work for both voxel_m > 0 (decimated, the default
     # in production) and voxel_m == 0 (undecimated, the legacy path).
     for label, voxel in (("decimated", 0.5), ("undecimated", 0.0)):
-        clusters, labels = cluster_instances(
+        clusters, labels, _ = cluster_instances(
             pts_f32, ecef_f32, eps=2.5, min_points=20, voxel_m=voxel,
         )
         assert labels.shape == (len(pts_f32),), (
@@ -219,7 +219,7 @@ def test_cluster_instances_accepts_f32_input():
         # counts on a clean synthetic — the precision-loss budget is
         # f32 noise on 0.5 m scale, ≪ 1 cluster.
         n_dec = len(clusters)
-        ref_clusters, _ = cluster_instances(
+        ref_clusters, _, _ = cluster_instances(
             pts_f64, ecef_f64, eps=2.5, min_points=20, voxel_m=voxel,
         )
         n_ref = len(ref_clusters)

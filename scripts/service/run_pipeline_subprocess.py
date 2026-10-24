@@ -54,6 +54,16 @@ class StatusWriter:
     def __init__(self, out_dir: Path):
         self.path = out_dir / "status.json"
 
+    def record_error(self, detail: str) -> None:
+        """Best-effort local diagnostic; also retain it in captured stderr."""
+        log.error("[%s] %s", self.path.parent.name, detail)
+        try:
+            with (self.path.parent / "error.log").open("a", encoding="utf-8") as f:
+                f.write(detail.rstrip() + "\n")
+        except OSError as exc:
+            log.warning("[%s] could not write error.log: %s",
+                        self.path.parent.name, exc)
+
     def write(self, *, step: str, progress: int, status: str,
               error: str | None = None) -> None:
         payload: dict = {
@@ -63,6 +73,7 @@ class StatusWriter:
         }
         if error is not None:
             payload["error"] = error
+            self.record_error(error)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
         tmp.replace(self.path)
@@ -195,20 +206,18 @@ def main() -> int:
         rc = run_pipeline.main(argv)
     except SystemExit as e:
         rc, err_msg = _parse_sys_exit(e)
+        if rc != 0:
+            writer.record_error(traceback.format_exc())
     except KeyboardInterrupt:
         writer.write(step="interrupted", progress=0, status="FAILED",
                      error="interrupted by signal")
         raise
     except Exception as e:
         tb = traceback.format_exc()
-        # Short summary for sidecar / HTTP response / callback (DB-friendly).
-        # 完整 traceback 落 <out_dir>/error.log 给运维查问题。
+        # Internal summary and full traceback; public responses use error_policy.
         short = f"{type(e).__name__}: {e}".strip() or "unknown error"
+        writer.record_error(tb)
         writer.write(step="failed", progress=0, status="FAILED", error=short)
-        try:
-            (out_dir / "error.log").write_text(tb, encoding="utf-8")
-        except OSError as log_exc:
-            log.warning("could not write error.log: %s", log_exc)
         return 1
 
     if rc == 0:

@@ -1,5 +1,17 @@
 # 服务运维文档（OPERATIONS）
 
+## 失败诊断与对外提示
+
+提交、查询及失败回调统一显示 `模型对比失败，请联系管理员。`。
+开发人员按 `taskId` 查询服务日志（使用 `run_service.sh` 时为仓库根目录
+`service.log`），以及 `<OUTPUT_BASE_DIR>/<taskId>/request.json`、
+`status.json`、`error.log`。内部保留真实原因；算法异常保留完整堆栈。
+路径检查失败、SystemExit 等也记录在 error.log；子进程启动失败、OSS
+上传失败及强制终止由父服务日志记录，强制终止不保证有 Python 堆栈。
+提交拒绝和任务不存在可能没有任务目录，以服务日志为准。
+诊断文件不作为 OSS 结果公开上传。重复提交不会改写已有任务快照。
+部署后重启对应服务加载变更；无合格疑似区仍正常返回成功空结果。
+
 > 适用版本：`scripts.service.api_server` 0.5.x
 > 读者：算法同事、容器 / 服务器运维。
 

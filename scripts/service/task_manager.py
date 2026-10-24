@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from oss_uploader import OssUploader
 
 from stage_meta import STAGE_FRIENDLY, STAGE_PROGRESS  # noqa: E402
+from error_policy import PUBLIC_FAILURE_MESSAGE
 
 
 log = logging.getLogger("task_manager")
@@ -456,6 +457,7 @@ class TaskStore:
                     base_err = f"subprocess killed by signal {-rc}: {base_err}"
 
             status.error_message = base_err
+            log.error("[%s] task failed (rc=%s): %s", task_id, rc, base_err)
             status.finished_at = time.time()
             # Try to upload any partial outputs that the algorithm left
             # on disk before failing — the callback can then carry
@@ -699,7 +701,7 @@ class TaskStore:
             "progress":        str(status.progress),
             "3dtilesUrl":      tiles_urls or None,
             "instanceJsonUrl": status.oss_instance_url,
-            "errorMessage":    status.error_message,
+            "errorMessage":    PUBLIC_FAILURE_MESSAGE if status.state == "FAILED" else None,
         }
 
         last_err: Optional[Exception] = None
