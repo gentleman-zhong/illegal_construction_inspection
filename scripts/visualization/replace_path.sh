@@ -7,7 +7,8 @@
 #   - 算法结果点云 (change / 3DTiles) → output/<task_id>/3DTiles/tileset.json
 #   - 聚类结果 (instances.json)       → output/<task_id>/instances.json
 #
-# 这 4 个路径都是绝对路径(以 / 开头),配合 Live Server serve root=/ 使用。
+# 自动将所需模型映射到项目 model/ 下，适配 Live Server 以项目为根目录。
+# 已有映射可复用；同名路径冲突时报错，绝不覆盖或移动原模型。
 # 不会改 cesium.html 的其他任何内容。
 
 set -euo pipefail
@@ -22,6 +23,9 @@ if [[ $# -ne 1 ]]; then
     exit 1
 fi
 TASK_ID="$1"
+[[ "$TASK_ID" =~ ^[A-Za-z0-9_.-]+$ && "$TASK_ID" != . && "$TASK_ID" != .. ]] || {
+    echo 'FATAL: 非法 task_id' >&2; exit 1;
+}
 
 HTML="$SCRIPT_DIR/cesium.html"
 REQ="$REPO_ROOT/output/$TASK_ID/request.json"
@@ -35,21 +39,47 @@ INSTANCES="$REPO_ROOT/output/$TASK_ID/instances.json"
 
 # ── 从 request.json 取 base / compare 的绝对路径 ──
 PYTHON_BIN="${PYTHON:-/root/miniconda3/envs/illegal_construction_inspection/bin/python}"
-read -r BASE_ABS COMPARE_ABS < <(
-    "$PYTHON_BIN" - "$REQ" <<'PY'
-import json, sys
+MAPPED_PATHS="$(
+    "$PYTHON_BIN" - "$REQ" "$REPO_ROOT" <<'PY'
+import json, os, sys
+from pathlib import Path
 req = json.load(open(sys.argv[1]))
-def coalesce(*vals):
-    for v in vals:
-        if v is not None and v != "":
-            return v
-    return ""
-print(
-    coalesce(req.get("baseModelPathResolved"), req.get("baseModelPath")),
-    coalesce(req.get("compareModelPathResolved"), req.get("compareModelPath")),
-)
+root = Path(sys.argv[2]) / 'model'
+if root.is_symlink() or (root.exists() and not root.is_dir()):
+    sys.exit(f'FATAL: 映射根目录必须是普通目录: {root}')
+plans = {}
+links = []
+for key in ('baseModelPath', 'compareModelPath'):
+    raw = req.get(key + 'Resolved') or req.get(key)
+    if not isinstance(raw, str) or not raw or '\n' in raw or '\r' in raw:
+        sys.exit(f'FATAL: 缺少或无效的 {key}')
+    source = Path(raw)
+    if not source.is_absolute():
+        source = Path(os.environ.get('MODEL_ROOT', '/model')) / source
+    if source.name == 'tileset.json':
+        source = source.parent
+    source = source.resolve()
+    if not (source / 'tileset.json').is_file():
+        sys.exit(f'FATAL: 模型 tileset.json 不存在: {source}')
+    target = root / source.name
+    if target in plans and plans[target] != source:
+        sys.exit(f'FATAL: 两个模型目录同名但路径不同: {target}')
+    if os.path.lexists(target) and not (target.is_symlink() and target.resolve() == source):
+        sys.exit(f'FATAL: 已有同名路径或映射指向其他模型，未覆盖: {target}')
+    plans[target] = source
+    links.append(target)
+# 全部校验通过后才创建，不使用覆盖选项。
+root.mkdir(exist_ok=True)
+for target, source in plans.items():
+    if not os.path.lexists(target):
+        target.symlink_to(source, target_is_directory=True)
+for target in links:
+    print(target)
 PY
-)
+ )"
+mapfile -t MODEL_PATHS <<< "$MAPPED_PATHS"
+BASE_ABS="${MODEL_PATHS[0]}"
+COMPARE_ABS="${MODEL_PATHS[1]}"
 [[ -n "$BASE_ABS" ]]    || { echo "FATAL: request.json 缺 baseModelPathResolved" >&2; exit 1; }
 [[ -n "$COMPARE_ABS" ]] || { echo "FATAL: request.json 缺 compareModelPathResolved" >&2; exit 1; }
 
@@ -62,11 +92,12 @@ mapfile -t REL < <(
         "$CHANGE" \
         "$INSTANCES" <<'PY'
 import os, sys
+from urllib.parse import quote
 html_dir = os.path.abspath(sys.argv[1])
 for p in sys.argv[2:]:
     rel = os.path.relpath(os.path.abspath(p), html_dir)
     # 浏览器/URL 永远用正斜杠,即便在 Windows 上跑也能正确生成 ../../../../model/...
-    print(rel.replace(os.sep, '/'))
+    print(quote(rel.replace(os.sep, '/'), safe='/'))
 PY
 )
 BASE_REL="${REL[0]}"

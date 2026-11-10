@@ -138,6 +138,12 @@ status_service() {
 }
 
 case "${1:-start}" in
+    foreground)
+        # Used by the service supervisor; keep one worker and existing defaults.
+        export OUTPUT_BASE_DIR LOG_LEVEL PORT MODEL_ROOT ALGO_DISABLE_OOM_PREFLIGHT ALGO_DBSCAN_VOXEL_M ALGO_EXTRACT_MAX_WORKERS
+        exec "$PY" -m uvicorn scripts.service.api_server:app \
+            --host 0.0.0.0 --port "$PORT" --workers 1
+        ;;
     start)   start_service ;;
     stop)    stop_service ;;
     restart) stop_service; start_service ;;

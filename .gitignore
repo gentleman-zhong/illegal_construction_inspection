@@ -11,6 +11,7 @@ dist/
 
 # ----- Test / coverage artifacts -----
 .pytest_cache/
+tests/service/_test_output/
 .coverage
 .coverage.*
 htmlcov/
@@ -19,6 +20,8 @@ htmlcov/
 
 # ----- Virtual envs -----
 .venv/
+.venv-adapter/
+.runtime-services/
 venv/
 env/
 ENV/
@@ -39,6 +42,8 @@ Thumbs.db
 service.log
 service.pid
 service.err
+gateway_adapter.log
+gateway_adapter.pid
 output/
 dataset_output/
 data/output/
@@ -52,5 +57,5 @@ scripts/service/oss_config.json
 
 # ----- Local data caches (downloaded 3D Tiles, etc.) -----
 # Uncomment if you do not want large b3dm / 3D Tiles datasets in git.
-# /model/
+/model/
 # /data/
